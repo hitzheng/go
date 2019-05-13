@@ -930,6 +930,11 @@ var pathEscapeTests = []EscapeTest{
 		nil,
 	},
 	{
+		"a/b",
+		"a%2Fb",
+		nil,
+	},
+	{
 		"one two",
 		"one%20two",
 		nil,
@@ -1629,6 +1634,12 @@ func TestURLHostname(t *testing.T) {
 		{"[1:2:3:4]", "1:2:3:4"},
 		{"[1:2:3:4]:80", "1:2:3:4"},
 		{"[::1]:80", "::1"},
+		{"[::1]", "::1"},
+		{"localhost", "localhost"},
+		{"localhost:443", "localhost"},
+		{"some.super.long.domain.example.org:8080", "some.super.long.domain.example.org"},
+		{"[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:17000", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"},
+		{"[2001:0db8:85a3:0000:0000:8a2e:0370:7334]", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"},
 	}
 	for _, tt := range tests {
 		u := &URL{Host: tt.host}
@@ -1738,10 +1749,31 @@ func TestNilUser(t *testing.T) {
 }
 
 func TestInvalidUserPassword(t *testing.T) {
-	_, err := Parse("http://us\ner:pass\nword@foo.com/")
+	_, err := Parse("http://user^:passwo^rd@foo.com/")
 	if got, wantsub := fmt.Sprint(err), "net/url: invalid userinfo"; !strings.Contains(got, wantsub) {
 		t.Errorf("error = %q; want substring %q", got, wantsub)
 	}
+}
+
+func TestRejectControlCharacters(t *testing.T) {
+	tests := []string{
+		"http://foo.com/?foo\nbar",
+		"http\r://foo.com/",
+		"http://foo\x7f.com/",
+	}
+	for _, s := range tests {
+		_, err := Parse(s)
+		const wantSub = "net/url: invalid control character in URL"
+		if got := fmt.Sprint(err); !strings.Contains(got, wantSub) {
+			t.Errorf("Parse(%q) error = %q; want substring %q", s, got, wantSub)
+		}
+	}
+
+	// But don't reject non-ASCII CTLs, at least for now:
+	if _, err := Parse("http://foo.com/ctl\x80"); err != nil {
+		t.Errorf("error parsing URL with non-ASCII control byte: %v", err)
+	}
+
 }
 
 var escapeBenchmarks = []struct {

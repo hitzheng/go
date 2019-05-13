@@ -46,9 +46,10 @@
 // If 'Index' is present, matches and submatches are identified by byte index
 // pairs within the input string: result[2*n:2*n+1] identifies the indexes of
 // the nth submatch. The pair for n==0 identifies the match of the entire
-// expression. If 'Index' is not present, the match is identified by the
-// text of the match/submatch. If an index is negative, it means that
-// subexpression did not match any string in the input.
+// expression. If 'Index' is not present, the match is identified by the text
+// of the match/submatch. If an index is negative or text is nil, it means that
+// subexpression did not match any string in the input. For 'String' versions
+// an empty string means either no match or an empty match.
 //
 // There is also a subset of the methods that can be applied to text read
 // from a RuneReader:
@@ -761,7 +762,7 @@ func (re *Regexp) Find(b []byte) []byte {
 	if a == nil {
 		return nil
 	}
-	return b[a[0]:a[1]]
+	return b[a[0]:a[1]:a[1]]
 }
 
 // FindIndex returns a two-element slice of integers defining the location of
@@ -829,7 +830,7 @@ func (re *Regexp) FindSubmatch(b []byte) [][]byte {
 	ret := make([][]byte, 1+re.numSubexp)
 	for i := range ret {
 		if 2*i < len(a) && a[2*i] >= 0 {
-			ret[i] = b[a[2*i]:a[2*i+1]]
+			ret[i] = b[a[2*i]:a[2*i+1]:a[2*i+1]]
 		}
 	}
 	return ret
@@ -1025,7 +1026,7 @@ func (re *Regexp) FindAll(b []byte, n int) [][]byte {
 		if result == nil {
 			result = make([][]byte, 0, startSize)
 		}
-		result = append(result, b[match[0]:match[1]])
+		result = append(result, b[match[0]:match[1]:match[1]])
 	})
 	return result
 }
@@ -1100,7 +1101,7 @@ func (re *Regexp) FindAllSubmatch(b []byte, n int) [][][]byte {
 		slice := make([][]byte, len(match)/2)
 		for j := range slice {
 			if match[2*j] >= 0 {
-				slice[j] = b[match[2*j]:match[2*j+1]]
+				slice[j] = b[match[2*j]:match[2*j+1]:match[2*j+1]]
 			}
 		}
 		result = append(result, slice)

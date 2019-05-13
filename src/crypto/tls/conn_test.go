@@ -142,6 +142,7 @@ func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 
 	handshakeDone := make(chan struct{})
 	recordSizesChan := make(chan []int, 1)
+	defer func() { <-recordSizesChan }() // wait for the goroutine to exit
 	go func() {
 		// This goroutine performs a TLS handshake over clientConn and
 		// then reads TLS records until EOF. It writes a slice that
@@ -181,11 +182,7 @@ func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 				return
 			}
 
-			// The last record will be a close_notify alert, which
-			// we don't wish to record.
-			if recordType(recordHeader[0]) == recordTypeApplicationData {
-				recordSizes = append(recordSizes, recordHeaderLen+length)
-			}
+			recordSizes = append(recordSizes, recordHeaderLen+length)
 		}
 
 		recordSizesChan <- recordSizes
@@ -215,8 +212,9 @@ func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 		t.Fatalf("Client encountered an error")
 	}
 
-	// Drop the size of last record, which is likely to be truncated.
-	recordSizes = recordSizes[:len(recordSizes)-1]
+	// Drop the size of the second to last record, which is likely to be
+	// truncated, and the last record, which is a close_notify alert.
+	recordSizes = recordSizes[:len(recordSizes)-2]
 
 	// recordSizes should contain a series of records smaller than
 	// tcpMSSEstimate followed by some larger than maxPlaintext.
@@ -241,19 +239,27 @@ func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 
 func TestDynamicRecordSizingWithStreamCipher(t *testing.T) {
 	config := testConfig.Clone()
+	config.MaxVersion = VersionTLS12
 	config.CipherSuites = []uint16{TLS_RSA_WITH_RC4_128_SHA}
 	runDynamicRecordSizingTest(t, config)
 }
 
 func TestDynamicRecordSizingWithCBC(t *testing.T) {
 	config := testConfig.Clone()
+	config.MaxVersion = VersionTLS12
 	config.CipherSuites = []uint16{TLS_RSA_WITH_AES_256_CBC_SHA}
 	runDynamicRecordSizingTest(t, config)
 }
 
 func TestDynamicRecordSizingWithAEAD(t *testing.T) {
 	config := testConfig.Clone()
+	config.MaxVersion = VersionTLS12
 	config.CipherSuites = []uint16{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256}
+	runDynamicRecordSizingTest(t, config)
+}
+
+func TestDynamicRecordSizingWithTLSv13(t *testing.T) {
+	config := testConfig.Clone()
 	runDynamicRecordSizingTest(t, config)
 }
 

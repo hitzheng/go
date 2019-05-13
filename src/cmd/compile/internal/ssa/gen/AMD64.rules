@@ -225,7 +225,8 @@
 (NeqPtr x y) && config.PtrSize == 4 -> (SETNE (CMPL x y))
 (Neq(32|64)F x y) -> (SETNEF (UCOMIS(S|D) x y))
 
-(Int64Hi x) -> (SHRQconst [32] x) // needed for amd64p32
+(Int64Hi x) -> (SHRQconst [32] x)         // needed for amd64p32
+(Int64Lo x) -> x
 
 // Lowering loads
 (Load <t> ptr mem) && (is64BitInt(t) || isPtr(t) && config.PtrSize == 8) -> (MOVQload ptr mem)
@@ -286,7 +287,16 @@
 (Move [7] dst src mem) ->
 	(MOVLstore [3] dst (MOVLload [3] src mem)
 		(MOVLstore dst (MOVLload src mem) mem))
-(Move [s] dst src mem) && s > 8 && s < 16 ->
+(Move [9] dst src mem) ->
+	(MOVBstore [8] dst (MOVBload [8] src mem)
+		(MOVQstore dst (MOVQload src mem) mem))
+(Move [10] dst src mem) ->
+	(MOVWstore [8] dst (MOVWload [8] src mem)
+		(MOVQstore dst (MOVQload src mem) mem))
+(Move [12] dst src mem) ->
+	(MOVLstore [8] dst (MOVLload [8] src mem)
+		(MOVQstore dst (MOVQload src mem) mem))
+(Move [s] dst src mem) && s == 11 || s >= 13 && s <= 15 ->
 	(MOVQstore [s-8] dst (MOVQload [s-8] src mem)
 		(MOVQstore dst (MOVQload src mem) mem))
 
@@ -517,6 +527,7 @@
 (If cond yes no) -> (NE (TESTB cond cond) yes no)
 
 // Atomic loads.  Other than preserving their ordering with respect to other loads, nothing special here.
+(AtomicLoad8 ptr mem) -> (MOVBatomicload ptr mem)
 (AtomicLoad32 ptr mem) -> (MOVLatomicload ptr mem)
 (AtomicLoad64 ptr mem) -> (MOVQatomicload ptr mem)
 (AtomicLoadPtr ptr mem) && config.PtrSize == 8 -> (MOVQatomicload ptr mem)
@@ -551,6 +562,15 @@
 
 // Write barrier.
 (WB {fn} destptr srcptr mem) -> (LoweredWB {fn} destptr srcptr mem)
+
+(PanicBounds [kind] x y mem) && boundsABI(kind) == 0 -> (LoweredPanicBoundsA [kind] x y mem)
+(PanicBounds [kind] x y mem) && boundsABI(kind) == 1 -> (LoweredPanicBoundsB [kind] x y mem)
+(PanicBounds [kind] x y mem) && boundsABI(kind) == 2 -> (LoweredPanicBoundsC [kind] x y mem)
+
+// For amd64p32
+(PanicExtend [kind] hi lo y mem) && boundsABI(kind) == 0 -> (LoweredPanicExtendA [kind] hi lo y mem)
+(PanicExtend [kind] hi lo y mem) && boundsABI(kind) == 1 -> (LoweredPanicExtendB [kind] hi lo y mem)
+(PanicExtend [kind] hi lo y mem) && boundsABI(kind) == 2 -> (LoweredPanicExtendC [kind] hi lo y mem)
 
 // ***************************
 // Above: lowering rules
@@ -2374,14 +2394,10 @@
 	((ADD|SUB|AND|OR|XOR|BTC|BTR|BTS)Qmodify [off] {sym} ptr x mem)
 
 // Merge ADDQconst and LEAQ into atomic loads.
-(MOVQatomicload [off1] {sym} (ADDQconst [off2] ptr) mem) && is32Bit(off1+off2) ->
-	(MOVQatomicload [off1+off2] {sym} ptr mem)
-(MOVLatomicload [off1] {sym} (ADDQconst [off2] ptr) mem) && is32Bit(off1+off2) ->
-	(MOVLatomicload [off1+off2] {sym} ptr mem)
-(MOVQatomicload [off1] {sym1} (LEAQ [off2] {sym2} ptr) mem) && is32Bit(off1+off2) && canMergeSym(sym1, sym2) ->
-	(MOVQatomicload [off1+off2] {mergeSym(sym1,sym2)} ptr mem)
-(MOVLatomicload [off1] {sym1} (LEAQ [off2] {sym2} ptr) mem) && is32Bit(off1+off2) && canMergeSym(sym1, sym2) ->
-	(MOVLatomicload [off1+off2] {mergeSym(sym1,sym2)} ptr mem)
+(MOV(Q|L|B)atomicload [off1] {sym} (ADDQconst [off2] ptr) mem) && is32Bit(off1+off2) ->
+	(MOV(Q|L|B)atomicload [off1+off2] {sym} ptr mem)
+(MOV(Q|L|B)atomicload [off1] {sym1} (LEAQ [off2] {sym2} ptr) mem) && is32Bit(off1+off2) && canMergeSym(sym1, sym2) ->
+	(MOV(Q|L|B)atomicload [off1+off2] {mergeSym(sym1,sym2)} ptr mem)
 
 // Merge ADDQconst and LEAQ into atomic stores.
 (XCHGQ [off1] {sym} val (ADDQconst [off2] ptr) mem) && is32Bit(off1+off2) ->

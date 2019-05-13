@@ -31,7 +31,7 @@ func panicmakeslicecap() {
 	panic(errorString("makeslice: cap out of range"))
 }
 
-func makeslice(et *_type, len, cap int) slice {
+func makeslice(et *_type, len, cap int) unsafe.Pointer {
 	mem, overflow := math.MulUintptr(et.size, uintptr(cap))
 	if overflow || mem > maxAlloc || len < 0 || len > cap {
 		// NOTE: Produce a 'len out of range' error instead of a
@@ -45,12 +45,11 @@ func makeslice(et *_type, len, cap int) slice {
 		}
 		panicmakeslicecap()
 	}
-	p := mallocgc(mem, et, true)
 
-	return slice{p, len, cap}
+	return mallocgc(mem, et, true)
 }
 
-func makeslice64(et *_type, len64, cap64 int64) slice {
+func makeslice64(et *_type, len64, cap64 int64) unsafe.Pointer {
 	len := int(len64)
 	if int64(len) != len64 {
 		panicmakeslicelen()
@@ -172,7 +171,7 @@ func growslice(et *_type, old slice, cap int) slice {
 	}
 
 	var p unsafe.Pointer
-	if et.kind&kindNoPointers != 0 {
+	if et.ptrdata == 0 {
 		p = mallocgc(capmem, nil, false)
 		// The append() that calls growslice is going to overwrite from old.len to cap (which will be the new length).
 		// Only clear the part that will not be overwritten.
@@ -180,7 +179,7 @@ func growslice(et *_type, old slice, cap int) slice {
 	} else {
 		// Note: can't use rawmem (which avoids zeroing of memory), because then GC can scan uninitialized memory.
 		p = mallocgc(capmem, et, true)
-		if writeBarrier.enabled {
+		if lenmem > 0 && writeBarrier.enabled {
 			// Only shade the pointers in old.array since we know the destination slice p
 			// only contains nil pointers because it has been cleared during alloc.
 			bulkBarrierPreWriteSrcOnly(uintptr(p), uintptr(old.array), lenmem)

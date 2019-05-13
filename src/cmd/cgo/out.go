@@ -6,7 +6,6 @@ package main
 
 import (
 	"bytes"
-	"cmd/internal/xcoff"
 	"debug/elf"
 	"debug/macho"
 	"debug/pe"
@@ -14,6 +13,7 @@ import (
 	"go/ast"
 	"go/printer"
 	"go/token"
+	"internal/xcoff"
 	"io"
 	"io/ioutil"
 	"os"
@@ -59,14 +59,14 @@ func (p *Package) writeDefs() {
 	fmt.Fprintf(fm, "int main() { return 0; }\n")
 	if *importRuntimeCgo {
 		fmt.Fprintf(fm, "void crosscall2(void(*fn)(void*, int, __SIZE_TYPE__), void *a, int c, __SIZE_TYPE__ ctxt) { }\n")
-		fmt.Fprintf(fm, "__SIZE_TYPE__ _cgo_wait_runtime_init_done() { return 0; }\n")
+		fmt.Fprintf(fm, "__SIZE_TYPE__ _cgo_wait_runtime_init_done(void) { return 0; }\n")
 		fmt.Fprintf(fm, "void _cgo_release_context(__SIZE_TYPE__ ctxt) { }\n")
 		fmt.Fprintf(fm, "char* _cgo_topofstack(void) { return (char*)0; }\n")
 	} else {
 		// If we're not importing runtime/cgo, we *are* runtime/cgo,
 		// which provides these functions. We just need a prototype.
 		fmt.Fprintf(fm, "void crosscall2(void(*fn)(void*, int, __SIZE_TYPE__), void *a, int c, __SIZE_TYPE__ ctxt);\n")
-		fmt.Fprintf(fm, "__SIZE_TYPE__ _cgo_wait_runtime_init_done();\n")
+		fmt.Fprintf(fm, "__SIZE_TYPE__ _cgo_wait_runtime_init_done(void);\n")
 		fmt.Fprintf(fm, "void _cgo_release_context(__SIZE_TYPE__);\n")
 	}
 	fmt.Fprintf(fm, "void _cgo_allocate(void *a, int c) { }\n")
@@ -246,7 +246,22 @@ func (p *Package) writeDefs() {
 
 	init := gccgoInit.String()
 	if init != "" {
-		fmt.Fprintln(fc, "static void init(void) __attribute__ ((constructor));")
+		// The init function does nothing but simple
+		// assignments, so it won't use much stack space, so
+		// it's OK to not split the stack. Splitting the stack
+		// can run into a bug in clang (as of 2018-11-09):
+		// this is a leaf function, and when clang sees a leaf
+		// function it won't emit the split stack prologue for
+		// the function. However, if this function refers to a
+		// non-split-stack function, which will happen if the
+		// cgo code refers to a C function not compiled with
+		// -fsplit-stack, then the linker will think that it
+		// needs to adjust the split stack prologue, but there
+		// won't be one. Marking the function explicitly
+		// no_split_stack works around this problem by telling
+		// the linker that it's OK if there is no split stack
+		// prologue.
+		fmt.Fprintln(fc, "static void init(void) __attribute__ ((constructor, no_split_stack));")
 		fmt.Fprintln(fc, "static void init(void) {")
 		fmt.Fprint(fc, init)
 		fmt.Fprintln(fc, "}")
@@ -321,6 +336,12 @@ func dynimport(obj string) {
 			fatalf("cannot load imported symbols from XCOFF file %s: %v", obj, err)
 		}
 		for _, s := range sym {
+			if s.Name == "runtime_rt0_go" || s.Name == "_rt0_ppc64_aix_lib" {
+				// These symbols are imported by runtime/cgo but
+				// must not be added to _cgo_import.go as there are
+				// Go symbols.
+				continue
+			}
 			fmt.Fprintf(stdout, "//go:cgo_import_dynamic %s %s %q\n", s.Name, s.Name, s.Library)
 		}
 		lib, err := f.ImportedLibraries()
@@ -761,8 +782,15 @@ func (p *Package) writeExports(fgo2, fm, fgcc, fgcch io.Writer) {
 	fmt.Fprintf(fgcc, "#include <stdlib.h>\n")
 	fmt.Fprintf(fgcc, "#include \"_cgo_export.h\"\n\n")
 
+	// We use packed structs, but they are always aligned.
+	// The pragmas and address-of-packed-member are only recognized as
+	// warning groups in clang 4.0+, so ignore unknown pragmas first.
+	fmt.Fprintf(fgcc, "#pragma GCC diagnostic ignored \"-Wunknown-pragmas\"\n")
+	fmt.Fprintf(fgcc, "#pragma GCC diagnostic ignored \"-Wpragmas\"\n")
+	fmt.Fprintf(fgcc, "#pragma GCC diagnostic ignored \"-Waddress-of-packed-member\"\n")
+
 	fmt.Fprintf(fgcc, "extern void crosscall2(void (*fn)(void *, int, __SIZE_TYPE__), void *, int, __SIZE_TYPE__);\n")
-	fmt.Fprintf(fgcc, "extern __SIZE_TYPE__ _cgo_wait_runtime_init_done();\n")
+	fmt.Fprintf(fgcc, "extern __SIZE_TYPE__ _cgo_wait_runtime_init_done(void);\n")
 	fmt.Fprintf(fgcc, "extern void _cgo_release_context(__SIZE_TYPE__);\n\n")
 	fmt.Fprintf(fgcc, "extern char* _cgo_topofstack(void);")
 	fmt.Fprintf(fgcc, "%s\n", tsanProlog)
@@ -1188,7 +1216,7 @@ func (p *Package) writeExportHeader(fgcch io.Writer) {
 	fmt.Fprintf(fgcch, "%s\n", p.gccExportHeaderProlog())
 }
 
-// gccgoUsesNewMangling returns whether gccgo uses the new collision-free
+// gccgoUsesNewMangling reports whether gccgo uses the new collision-free
 // packagepath mangling scheme (see determineGccgoManglingScheme for more
 // info).
 func gccgoUsesNewMangling() bool {
@@ -1240,7 +1268,7 @@ func determineGccgoManglingScheme() bool {
 	cmd := exec.Command(gccgocmd, "-S", "-o", "-", gofilename)
 	buf, cerr := cmd.CombinedOutput()
 	if cerr != nil {
-		fatalf("%s", err)
+		fatalf("%s", cerr)
 	}
 
 	// New mangling: expect go.l..u00e4ufer.Run
@@ -1256,7 +1284,7 @@ func gccgoPkgpathToSymbolNew(ppath string) string {
 	for _, c := range []byte(ppath) {
 		switch {
 		case 'A' <= c && c <= 'Z', 'a' <= c && c <= 'z',
-			'0' <= c && c <= '9', '_' == c:
+			'0' <= c && c <= '9', c == '_', c == '.':
 			bsl = append(bsl, c)
 		default:
 			changed = true
@@ -1339,19 +1367,19 @@ func c(repr string, args ...interface{}) *TypeRepr {
 
 // Map predeclared Go types to Type.
 var goTypes = map[string]*Type{
-	"bool":       {Size: 1, Align: 1, C: c("GoUint8")},
-	"byte":       {Size: 1, Align: 1, C: c("GoUint8")},
+	"bool":       {Size: 1, Align: 1, C: c("uint8_t")},
+	"byte":       {Size: 1, Align: 1, C: c("uint8_t")},
 	"int":        {Size: 0, Align: 0, C: c("GoInt")},
 	"uint":       {Size: 0, Align: 0, C: c("GoUint")},
-	"rune":       {Size: 4, Align: 4, C: c("GoInt32")},
-	"int8":       {Size: 1, Align: 1, C: c("GoInt8")},
-	"uint8":      {Size: 1, Align: 1, C: c("GoUint8")},
-	"int16":      {Size: 2, Align: 2, C: c("GoInt16")},
-	"uint16":     {Size: 2, Align: 2, C: c("GoUint16")},
-	"int32":      {Size: 4, Align: 4, C: c("GoInt32")},
-	"uint32":     {Size: 4, Align: 4, C: c("GoUint32")},
-	"int64":      {Size: 8, Align: 8, C: c("GoInt64")},
-	"uint64":     {Size: 8, Align: 8, C: c("GoUint64")},
+	"rune":       {Size: 4, Align: 4, C: c("int32_t")},
+	"int8":       {Size: 1, Align: 1, C: c("int8_t")},
+	"uint8":      {Size: 1, Align: 1, C: c("uint8_t")},
+	"int16":      {Size: 2, Align: 2, C: c("int16_t")},
+	"uint16":     {Size: 2, Align: 2, C: c("uint16_t")},
+	"int32":      {Size: 4, Align: 4, C: c("int32_t")},
+	"uint32":     {Size: 4, Align: 4, C: c("uint32_t")},
+	"int64":      {Size: 8, Align: 8, C: c("int64_t")},
+	"uint64":     {Size: 8, Align: 8, C: c("uint64_t")},
 	"float32":    {Size: 4, Align: 4, C: c("GoFloat32")},
 	"float64":    {Size: 8, Align: 8, C: c("GoFloat64")},
 	"complex64":  {Size: 8, Align: 4, C: c("GoComplex64")},
@@ -1458,6 +1486,15 @@ __cgo_size_assert(double, 8)
 
 extern char* _cgo_topofstack(void);
 
+/*
+  We use packed structs, but they are always aligned.
+  The pragmas and address-of-packed-member are only recognized as warning
+  groups in clang 4.0+, so ignore unknown pragmas first.
+*/
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Waddress-of-packed-member"
+
 #include <errno.h>
 #include <string.h>
 `
@@ -1540,6 +1577,7 @@ const builtinProlog = `
 /* Define intgo when compiling with GCC.  */
 typedef ptrdiff_t intgo;
 
+#define GO_CGO_GOSTRING_TYPEDEF
 typedef struct { const char *p; intgo n; } _GoString_;
 typedef struct { char *p; intgo n; intgo c; } _GoBytes_;
 _GoString_ GoString(char *p);
@@ -1791,15 +1829,20 @@ void localCgoCheckResult(Eface val) {
 // because _cgo_export.h defines GoString as a struct while builtinProlog
 // defines it as a function. We don't change this to avoid unnecessarily
 // breaking existing code.
+// The test of GO_CGO_GOSTRING_TYPEDEF avoids a duplicate definition
+// error if a Go file with a cgo comment #include's the export header
+// generated by a different package.
 const builtinExportProlog = `
-#line 1 "cgo-builtin-prolog"
+#line 1 "cgo-builtin-export-prolog"
 
 #include <stddef.h> /* for ptrdiff_t below */
 
 #ifndef GO_CGO_EXPORT_PROLOGUE_H
 #define GO_CGO_EXPORT_PROLOGUE_H
 
+#ifndef GO_CGO_GOSTRING_TYPEDEF
 typedef struct { const char *p; ptrdiff_t n; } _GoString_;
+#endif
 
 #endif
 `
@@ -1808,6 +1851,19 @@ func (p *Package) gccExportHeaderProlog() string {
 	return strings.Replace(gccExportHeaderProlog, "GOINTBITS", fmt.Sprint(8*p.IntSize), -1)
 }
 
+// gccExportHeaderProlog is written to the exported header, after the
+// import "C" comment preamble but before the generated declarations
+// of exported functions. This permits the generated declarations to
+// use the type names that appear in goTypes, above.
+//
+// The test of GO_CGO_GOSTRING_TYPEDEF avoids a duplicate definition
+// error if a Go file with a cgo comment #include's the export header
+// generated by a different package. Unfortunately GoString means two
+// different things: in this prolog it means a C name for the Go type,
+// while in the prolog written into the start of the C code generated
+// from a cgo-using Go file it means the C.GoString function. There is
+// no way to resolve this conflict, but it also doesn't make much
+// difference, as Go code never wants to refer to the latter meaning.
 const gccExportHeaderProlog = `
 /* Start of boilerplate cgo prologue.  */
 #line 1 "cgo-gcc-export-header-prolog"
@@ -1815,16 +1871,10 @@ const gccExportHeaderProlog = `
 #ifndef GO_CGO_PROLOGUE_H
 #define GO_CGO_PROLOGUE_H
 
-typedef signed char GoInt8;
-typedef unsigned char GoUint8;
-typedef short GoInt16;
-typedef unsigned short GoUint16;
-typedef int GoInt32;
-typedef unsigned int GoUint32;
-typedef long long GoInt64;
-typedef unsigned long long GoUint64;
-typedef GoIntGOINTBITS GoInt;
-typedef GoUintGOINTBITS GoUint;
+#include <stdint.h>
+
+typedef intGOINTBITS_t GoInt;
+typedef uintGOINTBITS_t GoUint;
 typedef __SIZE_TYPE__ GoUintptr;
 typedef float GoFloat32;
 typedef double GoFloat64;
@@ -1837,7 +1887,9 @@ typedef double _Complex GoComplex128;
 */
 typedef char _check_for_GOINTBITS_bit_pointer_matching_GoInt[sizeof(void*)==GOINTBITS/8 ? 1:-1];
 
+#ifndef GO_CGO_GOSTRING_TYPEDEF
 typedef _GoString_ GoString;
+#endif
 typedef void *GoMap;
 typedef void *GoChan;
 typedef struct { void *t; void *v; } GoInterface;
@@ -1873,5 +1925,5 @@ static void GoInit(void) {
 		runtime_iscgo = 1;
 }
 
-extern __SIZE_TYPE__ _cgo_wait_runtime_init_done() __attribute__ ((weak));
+extern __SIZE_TYPE__ _cgo_wait_runtime_init_done(void) __attribute__ ((weak));
 `
