@@ -16,18 +16,20 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	VersionSSL30 = 0x0300
 	VersionTLS10 = 0x0301
 	VersionTLS11 = 0x0302
 	VersionTLS12 = 0x0303
 	VersionTLS13 = 0x0304
+
+	// Deprecated: SSLv3 is cryptographically broken, and is no longer
+	// supported by this package. See golang.org/issue/32716.
+	VersionSSL30 = 0x0300
 )
 
 const (
@@ -149,16 +151,22 @@ const (
 // Certificate types (for certificateRequestMsg)
 const (
 	certTypeRSASign   = 1
-	certTypeECDSASign = 64 // RFC 4492, Section 5.5
+	certTypeECDSASign = 64 // ECDSA or EdDSA keys, see RFC 8422, Section 3.
 )
 
-// Signature algorithms (for internal signaling use). Starting at 16 to avoid overlap with
+// Signature algorithms (for internal signaling use). Starting at 225 to avoid overlap with
 // TLS 1.2 codepoints (RFC 5246, Appendix A.4.1), with which these have nothing to do.
 const (
-	signaturePKCS1v15 uint8 = iota + 16
-	signatureECDSA
+	signaturePKCS1v15 uint8 = iota + 225
 	signatureRSAPSS
+	signatureECDSA
+	signatureEd25519
 )
+
+// directSigning is a standard Hash value that signals that no pre-hashing
+// should be performed, and that the input should be signed directly. It is the
+// hash function associated with the Ed25519 signature scheme.
+var directSigning crypto.Hash = 0
 
 // supportedSignatureAlgorithms contains the signature and hash algorithms that
 // the code advertises as supported in a TLS 1.2+ ClientHello and in a TLS 1.2+
@@ -166,13 +174,29 @@ const (
 // Note that in TLS 1.2, the ECDSA algorithms are not constrained to P-256, etc.
 var supportedSignatureAlgorithms = []SignatureScheme{
 	PSSWithSHA256,
+	ECDSAWithP256AndSHA256,
+	Ed25519,
 	PSSWithSHA384,
 	PSSWithSHA512,
 	PKCS1WithSHA256,
-	ECDSAWithP256AndSHA256,
 	PKCS1WithSHA384,
-	ECDSAWithP384AndSHA384,
 	PKCS1WithSHA512,
+	ECDSAWithP384AndSHA384,
+	ECDSAWithP521AndSHA512,
+	PKCS1WithSHA1,
+	ECDSAWithSHA1,
+}
+
+// supportedSignatureAlgorithmsTLS12 contains the signature and hash algorithms
+// that are supported in TLS 1.2, where it is possible to distinguish the
+// protocol version. This is temporary, see Issue 32425.
+var supportedSignatureAlgorithmsTLS12 = []SignatureScheme{
+	PKCS1WithSHA256,
+	ECDSAWithP256AndSHA256,
+	Ed25519,
+	PKCS1WithSHA384,
+	PKCS1WithSHA512,
+	ECDSAWithP384AndSHA384,
 	ECDSAWithP521AndSHA512,
 	PKCS1WithSHA1,
 	ECDSAWithSHA1,
@@ -256,7 +280,7 @@ func requiresClientCert(c ClientAuthType) bool {
 // sessions.
 type ClientSessionState struct {
 	sessionTicket      []uint8               // Encrypted ticket used for session resumption with server
-	vers               uint16                // SSL/TLS version negotiated for the session
+	vers               uint16                // TLS version negotiated for the session
 	cipherSuite        uint16                // Ciphersuite negotiated for the session
 	masterSecret       []byte                // Full handshake MasterSecret, or TLS 1.3 resumption_master_secret
 	serverCertificates []*x509.Certificate   // Certificate chain presented by the server
@@ -306,6 +330,9 @@ const (
 	ECDSAWithP256AndSHA256 SignatureScheme = 0x0403
 	ECDSAWithP384AndSHA384 SignatureScheme = 0x0503
 	ECDSAWithP521AndSHA512 SignatureScheme = 0x0603
+
+	// EdDSA algorithms.
+	Ed25519 SignatureScheme = 0x0807
 
 	// Legacy signature and hash algorithms for TLS 1.2.
 	PKCS1WithSHA1 SignatureScheme = 0x0201
@@ -554,12 +581,12 @@ type Config struct {
 	// session resumption. It is only used by clients.
 	ClientSessionCache ClientSessionCache
 
-	// MinVersion contains the minimum SSL/TLS version that is acceptable.
-	// If zero, then TLS 1.0 is taken as the minimum.
+	// MinVersion contains the minimum TLS version that is acceptable.
+	// If zero, TLS 1.0 is currently taken as the minimum.
 	MinVersion uint16
 
-	// MaxVersion contains the maximum SSL/TLS version that is acceptable.
-	// If zero, then the maximum version supported by this package is used,
+	// MaxVersion contains the maximum TLS version that is acceptable.
+	// If zero, the maximum version supported by this package is used,
 	// which is currently TLS 1.3.
 	MaxVersion uint16
 
@@ -760,10 +787,9 @@ var supportedVersions = []uint16{
 	VersionTLS12,
 	VersionTLS11,
 	VersionTLS10,
-	VersionSSL30,
 }
 
-func (c *Config) supportedVersions(isClient bool) []uint16 {
+func (c *Config) supportedVersions() []uint16 {
 	versions := make([]uint16, 0, len(supportedVersions))
 	for _, v := range supportedVersions {
 		if c != nil && c.MinVersion != 0 && v < c.MinVersion {
@@ -772,59 +798,13 @@ func (c *Config) supportedVersions(isClient bool) []uint16 {
 		if c != nil && c.MaxVersion != 0 && v > c.MaxVersion {
 			continue
 		}
-		// TLS 1.0 is the minimum version supported as a client.
-		if isClient && v < VersionTLS10 {
-			continue
-		}
-		// TLS 1.3 is opt-out in Go 1.13.
-		if v == VersionTLS13 && !isTLS13Supported() {
-			continue
-		}
 		versions = append(versions, v)
 	}
 	return versions
 }
 
-// tls13Support caches the result for isTLS13Supported.
-var tls13Support struct {
-	sync.Once
-	cached bool
-}
-
-// isTLS13Supported returns whether the program enabled TLS 1.3 by not opting
-// out with GODEBUG=tls13=0. It's cached after the first execution.
-func isTLS13Supported() bool {
-	tls13Support.Do(func() {
-		tls13Support.cached = goDebugString("tls13") != "0"
-	})
-	return tls13Support.cached
-}
-
-// goDebugString returns the value of the named GODEBUG key.
-// GODEBUG is of the form "key=val,key2=val2".
-func goDebugString(key string) string {
-	s := os.Getenv("GODEBUG")
-	for i := 0; i < len(s)-len(key)-1; i++ {
-		if i > 0 && s[i-1] != ',' {
-			continue
-		}
-		afterKey := s[i+len(key):]
-		if afterKey[0] != '=' || s[i:i+len(key)] != key {
-			continue
-		}
-		val := afterKey[1:]
-		for i, b := range val {
-			if b == ',' {
-				return val[:i]
-			}
-		}
-		return val
-	}
-	return ""
-}
-
-func (c *Config) maxSupportedVersion(isClient bool) uint16 {
-	supportedVersions := c.supportedVersions(isClient)
+func (c *Config) maxSupportedVersion() uint16 {
+	supportedVersions := c.supportedVersions()
 	if len(supportedVersions) == 0 {
 		return 0
 	}
@@ -856,8 +836,8 @@ func (c *Config) curvePreferences() []CurveID {
 
 // mutualVersion returns the protocol version to use given the advertised
 // versions of the peer. Priority is given to the peer preference order.
-func (c *Config) mutualVersion(isClient bool, peerVersions []uint16) (uint16, bool) {
-	supportedVersions := c.supportedVersions(isClient)
+func (c *Config) mutualVersion(peerVersions []uint16) (uint16, bool) {
+	supportedVersions := c.supportedVersions()
 	for _, peerVersion := range peerVersions {
 		for _, v := range supportedVersions {
 			if v == peerVersion {
@@ -966,7 +946,7 @@ var writerMutex sync.Mutex
 type Certificate struct {
 	Certificate [][]byte
 	// PrivateKey contains the private key corresponding to the public key in
-	// Leaf. This must implement crypto.Signer with an RSA or ECDSA PublicKey.
+	// Leaf. This must implement crypto.Signer with an RSA, ECDSA or Ed25519 PublicKey.
 	// For a server up to TLS 1.2, it can also implement crypto.Decrypter with
 	// an RSA PublicKey.
 	PrivateKey crypto.PrivateKey
@@ -1182,6 +1162,8 @@ func signatureFromSignatureScheme(signatureAlgorithm SignatureScheme) uint8 {
 		return signatureRSAPSS
 	case ECDSAWithSHA1, ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512:
 		return signatureECDSA
+	case Ed25519:
+		return signatureEd25519
 	default:
 		return 0
 	}

@@ -27,8 +27,8 @@ const LocPrefix = "go.loc."
 // RangePrefix is the prefix for all the symbols containing DWARF range lists.
 const RangePrefix = "go.range."
 
-// IsStmtPrefix is the prefix for all the symbols containing DWARF is_stmt info for the line number table.
-const IsStmtPrefix = "go.isstmt."
+// DebugLinesPrefix is the prefix for all the symbols containing DWARF debug_line information from the compiler.
+const DebugLinesPrefix = "go.debuglines."
 
 // ConstInfoPrefix is the prefix for all symbols containing DWARF info
 // entries that contain constants.
@@ -143,6 +143,20 @@ func (s *Scope) UnifyRanges(c *Scope) {
 	}
 
 	s.Ranges = out
+}
+
+// AppendRange adds r to s, if r is non-empty.
+// If possible, it extends the last Range in s.Ranges; if not, it creates a new one.
+func (s *Scope) AppendRange(r Range) {
+	if r.End <= r.Start {
+		return
+	}
+	i := len(s.Ranges)
+	if i > 0 && s.Ranges[i-1].End == r.Start {
+		s.Ranges[i-1].End = r.End
+		return
+	}
+	s.Ranges = append(s.Ranges, r)
 }
 
 type InlCalls struct {

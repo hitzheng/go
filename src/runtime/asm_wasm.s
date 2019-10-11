@@ -37,17 +37,12 @@ TEXT runtime·gogo(SB), NOSPLIT, $0-8
 	MOVD gobuf_g(R0), g
 	MOVD gobuf_sp(R0), SP
 
+	// Put target PC at -8(SP), wasm_pc_f_loop will pick it up
+	Get SP
+	I32Const $8
+	I32Sub
 	I64Load gobuf_pc(R0)
-	I32WrapI64
-	I32Const $16
-	I32ShrU
-	Set PC_F
-
-	I64Load gobuf_pc(R0)
-	I64Const $0xFFFF
-	I64And
-	I32WrapI64
-	Set PC_B
+	I64Store $0
 
 	MOVD gobuf_ret(R0), RET0
 	MOVD gobuf_ctxt(R0), CTXT
@@ -180,6 +175,16 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-8
 
 TEXT runtime·systemstack_switch(SB), NOSPLIT, $0-0
 	RET
+
+// AES hashing not implemented for wasm
+TEXT runtime·memhash(SB),NOSPLIT|NOFRAME,$0-32
+	JMP	runtime·memhashFallback(SB)
+TEXT runtime·strhash(SB),NOSPLIT|NOFRAME,$0-24
+	JMP	runtime·strhashFallback(SB)
+TEXT runtime·memhash32(SB),NOSPLIT|NOFRAME,$0-24
+	JMP	runtime·memhash32Fallback(SB)
+TEXT runtime·memhash64(SB),NOSPLIT|NOFRAME,$0-24
+	JMP	runtime·memhash64Fallback(SB)
 
 TEXT runtime·return0(SB), NOSPLIT, $0-0
 	MOVD $0, RET0

@@ -981,7 +981,7 @@ Found:
 var errNoModules = errors.New("not using modules")
 
 // importGo checks whether it can use the go command to find the directory for path.
-// If using the go command is not appopriate, importGo returns errNoModules.
+// If using the go command is not appropriate, importGo returns errNoModules.
 // Otherwise, importGo tries using the go command and reports whether that succeeded.
 // Using the go command lets build.Import and build.Context.Import find code
 // in Go modules. In the long term we want tools to use go/packages (currently golang.org/x/tools/go/packages),
@@ -1001,27 +1001,29 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode, 
 		return errNoModules
 	}
 
-	// If modules are not enabled, then the in-process code works fine and we should keep using it.
-	// TODO(bcmills): This assumes that the default is "auto" instead of "on".
-	switch os.Getenv("GO111MODULE") {
+	// Find the absolute source directory. hasSubdir does not handle
+	// relative paths (and can't because the callbacks don't support this).
+	absSrcDir, err := filepath.Abs(srcDir)
+	if err != nil {
+		return errNoModules
+	}
+
+	// Predict whether module aware mode is enabled by checking the value of
+	// GO111MODULE and looking for a go.mod file in the source directory or
+	// one of its parents. Running 'go env GOMOD' in the source directory would
+	// give a canonical answer, but we'd prefer not to execute another command.
+	go111Module := os.Getenv("GO111MODULE")
+	switch go111Module {
 	case "off":
 		return errNoModules
-	case "on":
-		// ok
-	default: // "", "auto", anything else
-		// Automatic mode: no module use in $GOPATH/src.
-		for _, root := range gopath {
-			sub, ok := ctxt.hasSubdir(root, srcDir)
-			if ok && strings.HasPrefix(sub, "src/") {
-				return errNoModules
-			}
-		}
+	default: // "", "on", "auto", anything else
+		// Maybe use modules.
 	}
 
 	// If the source directory is in GOROOT, then the in-process code works fine
 	// and we should keep using it. Moreover, the 'go list' approach below doesn't
 	// take standard-library vendoring into account and will fail.
-	if _, ok := ctxt.hasSubdir(filepath.Join(ctxt.GOROOT, "src"), srcDir); ok {
+	if _, ok := ctxt.hasSubdir(filepath.Join(ctxt.GOROOT, "src"), absSrcDir); ok {
 		return errNoModules
 	}
 
@@ -1033,24 +1035,24 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode, 
 		}
 	}
 
-	// Look to see if there is a go.mod.
-	abs, err := filepath.Abs(srcDir)
-	if err != nil {
-		return errNoModules
-	}
-	for {
-		info, err := os.Stat(filepath.Join(abs, "go.mod"))
-		if err == nil && !info.IsDir() {
-			break
+	// Unless GO111MODULE=on, look to see if there is a go.mod.
+	// Since go1.13, it doesn't matter if we're inside GOPATH.
+	if go111Module != "on" {
+		parent := absSrcDir
+		for {
+			info, err := os.Stat(filepath.Join(parent, "go.mod"))
+			if err == nil && !info.IsDir() {
+				break
+			}
+			d := filepath.Dir(parent)
+			if len(d) >= len(parent) {
+				return errNoModules // reached top of file system, no go.mod
+			}
+			parent = d
 		}
-		d := filepath.Dir(abs)
-		if len(d) >= len(abs) {
-			return errNoModules // reached top of file system, no go.mod
-		}
-		abs = d
 	}
 
-	cmd := exec.Command("go", "list", "-compiler="+ctxt.Compiler, "-tags="+strings.Join(ctxt.BuildTags, ","), "-installsuffix="+ctxt.InstallSuffix, "-f={{.Dir}}\n{{.ImportPath}}\n{{.Root}}\n{{.Goroot}}\n", path)
+	cmd := exec.Command("go", "list", "-e", "-compiler="+ctxt.Compiler, "-tags="+strings.Join(ctxt.BuildTags, ","), "-installsuffix="+ctxt.InstallSuffix, "-f={{.Dir}}\n{{.ImportPath}}\n{{.Root}}\n{{.Goroot}}\n{{if .Error}}{{.Error}}{{end}}\n", "--", path)
 
 	// TODO(bcmills): This is wrong if srcDir is in a vendor directory, or if
 	// srcDir is in some module dependency of the main module. The main module
@@ -1077,12 +1079,22 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode, 
 		return fmt.Errorf("go/build: importGo %s: %v\n%s\n", path, err, stderr.String())
 	}
 
-	f := strings.Split(stdout.String(), "\n")
-	if len(f) != 5 || f[4] != "" {
+	f := strings.SplitN(stdout.String(), "\n", 5)
+	if len(f) != 5 {
 		return fmt.Errorf("go/build: importGo %s: unexpected output:\n%s\n", path, stdout.String())
 	}
+	dir := f[0]
+	errStr := strings.TrimSpace(f[4])
+	if errStr != "" && p.Dir == "" {
+		// If 'go list' could not locate the package, return the same error that
+		// 'go list' reported.
+		// If 'go list' did locate the package (p.Dir is not empty), ignore the
+		// error. It was probably related to loading source files, and we'll
+		// encounter it ourselves shortly.
+		return errors.New(errStr)
+	}
 
-	p.Dir = f[0]
+	p.Dir = dir
 	p.ImportPath = f[1]
 	p.Root = f[2]
 	p.Goroot = f[3] == "true"
@@ -1556,7 +1568,8 @@ func (ctxt *Context) makePathsAbsolute(args []string, srcDir string) {
 // The @ is for OS X. See golang.org/issue/13720.
 // The % is for Jenkins. See golang.org/issue/16959.
 // The ! is because module paths may use them. See golang.org/issue/26716.
-const safeString = "+-.,/0123456789=ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz:$@%! "
+// The ~ and ^ are for sr.ht. See golang.org/issue/32260.
+const safeString = "+-.,/0123456789=ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz:$@%! ~^"
 
 func safeCgoName(s string) bool {
 	if s == "" {

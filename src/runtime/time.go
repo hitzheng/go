@@ -13,8 +13,6 @@ import (
 
 // Package time knows the layout of this structure.
 // If this struct changes, adjust ../time/sleep.go:/runtimeTimer.
-// For GOOS=nacl, package syscall knows the layout of this structure.
-// If this struct changes, adjust ../syscall/net_nacl.go:/runtimeTimer.
 type timer struct {
 	tb *timersBucket // the bucket the timer lives in
 	i  int           // heap index
@@ -70,9 +68,6 @@ type timersBucket struct {
 	waitnote     note
 	t            []*timer
 }
-
-// nacl fake time support - time in nanoseconds since 1970
-var faketime int64
 
 // Package time APIs.
 // Godoc uses the comments in package time, not these.

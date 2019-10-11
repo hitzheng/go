@@ -31,16 +31,14 @@ func renameinit() *types.Sym {
 //   2) Initialize all the variables that have initializers.
 //   3) Run any init functions.
 func fninit(n []*Node) {
-	nf := initfix(n)
+	nf := initOrder(n)
 
 	var deps []*obj.LSym // initTask records for packages the current package depends on
 	var fns []*obj.LSym  // functions to call for package initialization
 
 	// Find imported packages with init tasks.
-	for _, p := range types.ImportedPkgList() {
-		if s, ok := p.LookupOK(".inittask"); ok {
-			deps = append(deps, s.Linksym())
-		}
+	for _, s := range types.InitSyms {
+		deps = append(deps, s.Linksym())
 	}
 
 	// Make a function that contains all the initialization statements.
@@ -103,10 +101,4 @@ func fninit(n []*Node) {
 	// An initTask has pointers, but none into the Go heap.
 	// It's not quite read only, the state field must be modifiable.
 	ggloblsym(lsym, int32(ot), obj.NOPTR)
-}
-
-func (n *Node) checkInitFuncSignature() {
-	if n.Type.NumRecvs()+n.Type.NumParams()+n.Type.NumResults() > 0 {
-		Fatalf("init function cannot have receiver, params, or results: %v (%v)", n, n.Type)
-	}
 }

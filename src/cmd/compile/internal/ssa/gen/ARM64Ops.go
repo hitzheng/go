@@ -495,14 +495,14 @@ func init() {
 		// arg1 = mem
 		// auxint = offset into duffzero code to start executing
 		// returns mem
-		// R16 aka arm64.REGRT1 changed as side effect
+		// R20 changed as side effect
 		{
 			name:      "DUFFZERO",
 			aux:       "Int64",
 			argLength: 2,
 			reg: regInfo{
-				inputs:   []regMask{buildReg("R16")},
-				clobbers: buildReg("R16 R30"),
+				inputs:   []regMask{buildReg("R20")},
+				clobbers: buildReg("R20 R30"),
 			},
 			faultOnNilArg0: true,
 		},
@@ -529,19 +529,19 @@ func init() {
 		},
 
 		// duffcopy
-		// arg0 = address of dst memory (in R17 aka arm64.REGRT2, changed as side effect)
-		// arg1 = address of src memory (in R16 aka arm64.REGRT1, changed as side effect)
+		// arg0 = address of dst memory (in R21, changed as side effect)
+		// arg1 = address of src memory (in R20, changed as side effect)
 		// arg2 = mem
 		// auxint = offset into duffcopy code to start executing
 		// returns mem
-		// R16, R17 changed as side effect
+		// R20, R21 changed as side effect
 		{
 			name:      "DUFFCOPY",
 			aux:       "Int64",
 			argLength: 3,
 			reg: regInfo{
-				inputs:   []regMask{buildReg("R17"), buildReg("R16")},
-				clobbers: buildReg("R16 R17 R26 R30"),
+				inputs:   []regMask{buildReg("R21"), buildReg("R20")},
+				clobbers: buildReg("R20 R21 R26 R30"),
 			},
 			faultOnNilArg0: true,
 			faultOnNilArg1: true,
@@ -678,26 +678,26 @@ func init() {
 	}
 
 	blocks := []blockData{
-		{name: "EQ"},
-		{name: "NE"},
-		{name: "LT"},
-		{name: "LE"},
-		{name: "GT"},
-		{name: "GE"},
-		{name: "ULT"},
-		{name: "ULE"},
-		{name: "UGT"},
-		{name: "UGE"},
-		{name: "Z"},    // Control == 0 (take a register instead of flags)
-		{name: "NZ"},   // Control != 0
-		{name: "ZW"},   // Control == 0, 32-bit
-		{name: "NZW"},  // Control != 0, 32-bit
-		{name: "TBZ"},  // Control & (1 << Aux.(int64)) == 0
-		{name: "TBNZ"}, // Control & (1 << Aux.(int64)) != 0
-		{name: "FLT"},
-		{name: "FLE"},
-		{name: "FGT"},
-		{name: "FGE"},
+		{name: "EQ", controls: 1},
+		{name: "NE", controls: 1},
+		{name: "LT", controls: 1},
+		{name: "LE", controls: 1},
+		{name: "GT", controls: 1},
+		{name: "GE", controls: 1},
+		{name: "ULT", controls: 1},
+		{name: "ULE", controls: 1},
+		{name: "UGT", controls: 1},
+		{name: "UGE", controls: 1},
+		{name: "Z", controls: 1},    // Control == 0 (take a register instead of flags)
+		{name: "NZ", controls: 1},   // Control != 0
+		{name: "ZW", controls: 1},   // Control == 0, 32-bit
+		{name: "NZW", controls: 1},  // Control != 0, 32-bit
+		{name: "TBZ", controls: 1},  // Control & (1 << Aux.(int64)) == 0
+		{name: "TBNZ", controls: 1}, // Control & (1 << Aux.(int64)) != 0
+		{name: "FLT", controls: 1},
+		{name: "FLE", controls: 1},
+		{name: "FGT", controls: 1},
+		{name: "FGE", controls: 1},
 	}
 
 	archs = append(archs, arch{

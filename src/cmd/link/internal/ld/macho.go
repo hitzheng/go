@@ -141,7 +141,7 @@ const (
 	LC_SUB_LIBRARY              = 0x15
 	LC_TWOLEVEL_HINTS           = 0x16
 	LC_PREBIND_CKSUM            = 0x17
-	LC_LOAD_WEAK_DYLIB          = 0x18
+	LC_LOAD_WEAK_DYLIB          = 0x80000018
 	LC_SEGMENT_64               = 0x19
 	LC_ROUTINES_64              = 0x1a
 	LC_UUID                     = 0x1b
@@ -869,6 +869,7 @@ func machosymtab(ctxt *Link) {
 		symtab.AddUint32(ctxt.Arch, uint32(symstr.Size))
 
 		export := machoShouldExport(ctxt, s)
+		isGoSymbol := strings.Contains(s.Extname(), ".")
 
 		// In normal buildmodes, only add _ to C symbols, as
 		// Go symbols have dot in the name.
@@ -877,8 +878,8 @@ func machosymtab(ctxt *Link) {
 		// symbols like crosscall2 are in pclntab and end up
 		// pointing at the host binary, breaking unwinding.
 		// See Issue #18190.
-		cexport := !strings.Contains(s.Extname(), ".") && (ctxt.BuildMode != BuildModePlugin || onlycsymbol(s))
-		if cexport || export {
+		cexport := !isGoSymbol && (ctxt.BuildMode != BuildModePlugin || onlycsymbol(s))
+		if cexport || export || isGoSymbol {
 			symstr.AddUint8('_')
 		}
 

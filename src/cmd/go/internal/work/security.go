@@ -184,6 +184,8 @@ var validLinkerFlags = []*lazyregexp.Regexp{
 	re(`-Wl,-framework,[^,@\-][^,]+`),
 	re(`-Wl,-headerpad_max_install_names`),
 	re(`-Wl,--no-undefined`),
+	re(`-Wl,-R([^@\-][^,@]*$)`),
+	re(`-Wl,--just-symbols[=,]([^,@\-][^,@]+)`),
 	re(`-Wl,-rpath(-link)?[=,]([^,@\-][^,]+)`),
 	re(`-Wl,-s`),
 	re(`-Wl,-search_paths_first`),
@@ -213,6 +215,8 @@ var validLinkerFlagsWithNextArg = []string{
 	"-target",
 	"-Wl,-framework",
 	"-Wl,-rpath",
+	"-Wl,-R",
+	"-Wl,--just-symbols",
 	"-Wl,-undefined",
 }
 
@@ -274,6 +278,15 @@ Args:
 					!strings.Contains(list[i+1][4:], ",") {
 					i++
 					continue Args
+				}
+
+				// Permit -I= /path, -I $SYSROOT.
+				if i+1 < len(list) && arg == "-I" {
+					if (strings.HasPrefix(list[i+1], "=") || strings.HasPrefix(list[i+1], "$SYSROOT")) &&
+						load.SafeArg(list[i+1][1:]) {
+						i++
+						continue Args
+					}
 				}
 
 				if i+1 < len(list) {

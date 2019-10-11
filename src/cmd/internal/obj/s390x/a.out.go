@@ -240,6 +240,7 @@ const (
 	AMULLD
 	AMULHD
 	AMULHDU
+	AMLGR
 	ASUB
 	ASUBC
 	ASUBV
@@ -267,6 +268,8 @@ const (
 	AMOVDLE
 	AMOVDLT
 	AMOVDNE
+	ALOCR
+	ALOCGR
 
 	// find leftmost one
 	AFLOGR
@@ -393,6 +396,7 @@ const (
 	// branch
 	ABC
 	ABCL
+	ABRC
 	ABEQ
 	ABGE
 	ABGT
@@ -405,7 +409,19 @@ const (
 	ABVS
 	ASYSCALL
 
+	// branch on count
+	ABRCT
+	ABRCTG
+
 	// compare and branch
+	ACRJ
+	ACGRJ
+	ACLRJ
+	ACLGRJ
+	ACIJ
+	ACGIJ
+	ACLIJ
+	ACLGIJ
 	ACMPBEQ
 	ACMPBGE
 	ACMPBGT
@@ -965,6 +981,8 @@ const (
 	AVMSLEG
 	AVMSLOG
 	AVMSLEOG
+
+	ANOPH // NOP
 
 	// binary
 	ABYTE

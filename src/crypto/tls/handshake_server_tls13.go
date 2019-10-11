@@ -108,7 +108,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		if id == TLS_FALLBACK_SCSV {
 			// Use c.vers instead of max(supported_versions) because an attacker
 			// could defeat this by adding an arbitrary high version otherwise.
-			if c.vers < c.config.maxSupportedVersion(false) {
+			if c.vers < c.config.maxSupportedVersion() {
 				c.sendAlert(alertInappropriateFallback)
 				return errors.New("tls: client using inappropriate protocol fallback")
 			}
@@ -510,7 +510,6 @@ func illegalClientHelloChange(ch, ch1 *clientHelloMsg) bool {
 		!bytes.Equal(ch.random, ch1.random) ||
 		!bytes.Equal(ch.sessionId, ch1.sessionId) ||
 		!bytes.Equal(ch.compressionMethods, ch1.compressionMethods) ||
-		ch.nextProtoNeg != ch1.nextProtoNeg ||
 		ch.serverName != ch1.serverName ||
 		ch.ocspStapling != ch1.ocspStapling ||
 		!bytes.Equal(ch.supportedPoints, ch1.supportedPoints) ||
@@ -626,14 +625,13 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 	if sigType == 0 || err != nil {
 		return c.sendAlert(alertInternalError)
 	}
-	h := sigHash.New()
-	writeSignedMessage(h, serverSignatureContext, hs.transcript)
 
+	signed := signedMessage(sigHash, serverSignatureContext, hs.transcript)
 	signOpts := crypto.SignerOpts(sigHash)
 	if sigType == signatureRSAPSS {
 		signOpts = &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: sigHash}
 	}
-	sig, err := hs.cert.PrivateKey.(crypto.Signer).Sign(c.config.rand(), h.Sum(nil), signOpts)
+	sig, err := hs.cert.PrivateKey.(crypto.Signer).Sign(c.config.rand(), signed, signOpts)
 	if err != nil {
 		public := hs.cert.PrivateKey.(crypto.Signer).Public()
 		if rsaKey, ok := public.(*rsa.PublicKey); ok && sigType == signatureRSAPSS &&
@@ -815,10 +813,9 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 			c.sendAlert(alertIllegalParameter)
 			return errors.New("tls: invalid certificate signature algorithm")
 		}
-		h := sigHash.New()
-		writeSignedMessage(h, clientSignatureContext, hs.transcript)
+		signed := signedMessage(sigHash, clientSignatureContext, hs.transcript)
 		if err := verifyHandshakeSignature(sigType, c.peerCertificates[0].PublicKey,
-			sigHash, h.Sum(nil), certVerify.signature); err != nil {
+			sigHash, signed, certVerify.signature); err != nil {
 			c.sendAlert(alertDecryptError)
 			return errors.New("tls: invalid certificate signature")
 		}

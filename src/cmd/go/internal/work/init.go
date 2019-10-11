@@ -60,6 +60,11 @@ func instrumentInit() {
 	mode := "race"
 	if cfg.BuildMSan {
 		mode = "msan"
+		// MSAN does not support non-PIE binaries on ARM64.
+		// See issue #33712 for details.
+		if cfg.Goos == "linux" && cfg.Goarch == "arm64" && cfg.BuildBuildmode == "default" {
+			cfg.BuildBuildmode = "pie"
+		}
 	}
 	modeFlag := "-" + mode
 
@@ -197,6 +202,7 @@ func buildModeInit() {
 			case "darwin/amd64":
 				// Skip DWARF generation due to #21647
 				forcedLdflags = append(forcedLdflags, "-w")
+			case "freebsd/amd64":
 			default:
 				base.Fatalf("-buildmode=plugin not supported on %s\n", platform)
 			}
@@ -241,12 +247,12 @@ func buildModeInit() {
 	switch cfg.BuildMod {
 	case "":
 		// ok
-	case "readonly", "vendor":
+	case "readonly", "vendor", "mod":
 		if load.ModLookup == nil && !inGOFLAGS("-mod") {
 			base.Fatalf("build flag -mod=%s only valid when using modules", cfg.BuildMod)
 		}
 	default:
-		base.Fatalf("-mod=%s not supported (can be '', 'readonly', or 'vendor')", cfg.BuildMod)
+		base.Fatalf("-mod=%s not supported (can be '', 'mod', 'readonly', or 'vendor')", cfg.BuildMod)
 	}
 }
 

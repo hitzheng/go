@@ -5,7 +5,6 @@
 package fmt
 
 import (
-	"errors"
 	"internal/fmtsort"
 	"io"
 	"os"
@@ -123,6 +122,10 @@ type pp struct {
 	panicking bool
 	// erroring is set when printing an error string to guard against calling handleMethods.
 	erroring bool
+	// wrapErrs is set when the format string may contain a %w verb.
+	wrapErrs bool
+	// wrappedErr records the target of the %w verb.
+	wrappedErr error
 }
 
 var ppFree = sync.Pool{
@@ -134,6 +137,7 @@ func newPrinter() *pp {
 	p := ppFree.Get().(*pp)
 	p.panicking = false
 	p.erroring = false
+	p.wrapErrs = false
 	p.fmt.init(&p.buf)
 	return p
 }
@@ -153,6 +157,7 @@ func (p *pp) free() {
 	p.buf = p.buf[:0]
 	p.arg = nil
 	p.value = reflect.Value{}
+	p.wrappedErr = nil
 	ppFree.Put(p)
 }
 
@@ -570,22 +575,27 @@ func (p *pp) handleMethods(verb rune) (handled bool) {
 	if p.erroring {
 		return
 	}
-	switch x := p.arg.(type) {
-	case errors.Formatter:
-		handled = true
-		defer p.catchPanic(p.arg, verb, "FormatError")
-		return fmtError(p, verb, x)
+	if verb == 'w' {
+		// It is invalid to use %w other than with Errorf, more than once,
+		// or with a non-error arg.
+		err, ok := p.arg.(error)
+		if !ok || !p.wrapErrs || p.wrappedErr != nil {
+			p.wrappedErr = nil
+			p.wrapErrs = false
+			p.badVerb(verb)
+			return true
+		}
+		p.wrappedErr = err
+		// If the arg is a Formatter, pass 'v' as the verb to it.
+		verb = 'v'
+	}
 
-	case Formatter:
+	// Is it a Formatter?
+	if formatter, ok := p.arg.(Formatter); ok {
 		handled = true
 		defer p.catchPanic(p.arg, verb, "Format")
-		x.Format(p, verb)
+		formatter.Format(p, verb)
 		return
-
-	case error:
-		handled = true
-		defer p.catchPanic(p.arg, verb, "Error")
-		return fmtError(p, verb, x)
 	}
 
 	// If we're doing Go syntax and the argument knows how to supply it, take care of it now.
@@ -603,7 +613,18 @@ func (p *pp) handleMethods(verb rune) (handled bool) {
 		// Println etc. set verb to %v, which is "stringable".
 		switch verb {
 		case 'v', 's', 'x', 'X', 'q':
-			if v, ok := p.arg.(Stringer); ok {
+			// Is it an error or Stringer?
+			// The duplication in the bodies is necessary:
+			// setting handled and deferring catchPanic
+			// must happen before calling the method.
+			switch v := p.arg.(type) {
+			case error:
+				handled = true
+				defer p.catchPanic(p.arg, verb, "Error")
+				p.fmtString(v.Error(), verb)
+				return
+
+			case Stringer:
 				handled = true
 				defer p.catchPanic(p.arg, verb, "String")
 				p.fmtString(v.String(), verb)

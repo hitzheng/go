@@ -31,10 +31,6 @@ func TestIntendedInlining(t *testing.T) {
 	// might not actually be inlined anywhere.
 	want := map[string][]string{
 		"runtime": {
-			// TODO(mvdan): enable these once mid-stack
-			// inlining is available
-			// "adjustctxt",
-
 			"add",
 			"acquirem",
 			"add1",
@@ -152,6 +148,10 @@ func TestIntendedInlining(t *testing.T) {
 			"addVW",
 			"subVW",
 		},
+		"math/rand": {
+			"(*rngSource).Int63",
+			"(*rngSource).Uint64",
+		},
 	}
 
 	if runtime.GOARCH != "386" && runtime.GOARCH != "mips64" && runtime.GOARCH != "mips64le" {
@@ -174,7 +174,7 @@ func TestIntendedInlining(t *testing.T) {
 	}
 
 	switch runtime.GOARCH {
-	case "nacl", "386", "wasm", "arm":
+	case "386", "wasm", "arm":
 	default:
 		// TODO(mvdan): As explained in /test/inline_sync.go, some
 		// architectures don't have atomic intrinsics, so these go over

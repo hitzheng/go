@@ -295,7 +295,7 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason w
 		throw("gopark: bad g status")
 	}
 	mp.waitlock = lock
-	mp.waitunlockf = *(*unsafe.Pointer)(unsafe.Pointer(&unlockf))
+	mp.waitunlockf = unlockf
 	gp.waitreason = reason
 	mp.waittraceev = traceEv
 	mp.waittraceskip = traceskip
@@ -413,7 +413,7 @@ func releaseSudog(s *sudog) {
 // use the result as an address at which to start executing code.
 //go:nosplit
 func funcPC(f interface{}) uintptr {
-	return **(**uintptr)(add(unsafe.Pointer(&f), sys.PtrSize))
+	return *(*uintptr)(efaceOf(&f).data)
 }
 
 // called from assembly
@@ -962,8 +962,23 @@ func restartg(gp *g) {
 // goroutines.
 func stopTheWorld(reason string) {
 	semacquire(&worldsema)
-	getg().m.preemptoff = reason
-	systemstack(stopTheWorldWithSema)
+	gp := getg()
+	gp.m.preemptoff = reason
+	systemstack(func() {
+		// Mark the goroutine which called stopTheWorld preemptible so its
+		// stack may be scanned.
+		// This lets a mark worker scan us while we try to stop the world
+		// since otherwise we could get in a mutual preemption deadlock.
+		// We must not modify anything on the G stack because a stack shrink
+		// may occur. A stack shrink is otherwise OK though because in order
+		// to return from this function (and to leave the system stack) we
+		// must have preempted all goroutines, including any attempting
+		// to scan our stack, in which case, any stack shrinking will
+		// have already completed by the time we exit.
+		casgstatus(gp, _Grunning, _Gwaiting)
+		stopTheWorldWithSema()
+		casgstatus(gp, _Gwaiting, _Grunning)
+	})
 }
 
 // startTheWorld undoes the effects of stopTheWorld.
@@ -975,9 +990,30 @@ func startTheWorld() {
 	getg().m.preemptoff = ""
 }
 
-// Holding worldsema grants an M the right to try to stop the world
-// and prevents gomaxprocs from changing concurrently.
+// stopTheWorldGC has the same effect as stopTheWorld, but blocks
+// until the GC is not running. It also blocks a GC from starting
+// until startTheWorldGC is called.
+func stopTheWorldGC(reason string) {
+	semacquire(&gcsema)
+	stopTheWorld(reason)
+}
+
+// startTheWorldGC undoes the effects of stopTheWorldGC.
+func startTheWorldGC() {
+	startTheWorld()
+	semrelease(&gcsema)
+}
+
+// Holding worldsema grants an M the right to try to stop the world.
 var worldsema uint32 = 1
+
+// Holding gcsema grants the M the right to block a GC, and blocks
+// until the current GC is done. In particular, it prevents gomaxprocs
+// from changing concurrently.
+//
+// TODO(mknyszek): Once gomaxprocs and the execution tracer can handle
+// being changed/enabled during a GC, remove this.
+var gcsema uint32 = 1
 
 // stopTheWorldWithSema is the core implementation of stopTheWorld.
 // The caller is responsible for acquiring worldsema and disabling
@@ -1167,7 +1203,8 @@ func mstart() {
 	mstart1()
 
 	// Exit this thread.
-	if GOOS == "windows" || GOOS == "solaris" || GOOS == "illumos" || GOOS == "plan9" || GOOS == "darwin" || GOOS == "aix" {
+	switch GOOS {
+	case "windows", "solaris", "illumos", "plan9", "darwin", "aix":
 		// Windows, Solaris, illumos, Darwin, AIX and Plan 9 always system-allocate
 		// the stack, but put it in _g_.stack before mstart,
 		// so the logic above hasn't set osStack yet.
@@ -2166,7 +2203,7 @@ func execute(gp *g, inheritTime bool) {
 }
 
 // Finds a runnable goroutine to execute.
-// Tries to steal from other P's, get g from global queue, poll network.
+// Tries to steal from other P's, get g from local or global queue, poll network.
 func findrunnable() (gp *g, inheritTime bool) {
 	_g_ := getg()
 
@@ -2595,8 +2632,7 @@ func park_m(gp *g) {
 	casgstatus(gp, _Grunning, _Gwaiting)
 	dropg()
 
-	if _g_.m.waitunlockf != nil {
-		fn := *(*func(*g, unsafe.Pointer) bool)(unsafe.Pointer(&_g_.m.waitunlockf))
+	if fn := _g_.m.waitunlockf; fn != nil {
 		ok := fn(gp, _g_.m.waitlock)
 		_g_.m.waitunlockf = nil
 		_g_.m.waitlock = nil
@@ -2851,7 +2887,11 @@ func reentersyscall(pc, sp uintptr) {
 }
 
 // Standard syscall entry used by the go syscall library and normal cgo calls.
+//
+// This is exported via linkname to assembly in the syscall package.
+//
 //go:nosplit
+//go:linkname entersyscall
 func entersyscall() {
 	reentersyscall(getcallerpc(), getcallersp())
 }
@@ -2941,8 +2981,11 @@ func entersyscallblock_handoff() {
 //
 // Write barriers are not allowed because our P may have been stolen.
 //
+// This is exported via linkname to assembly in the syscall package.
+//
 //go:nosplit
 //go:nowritebarrierrec
+//go:linkname exitsyscall
 func exitsyscall() {
 	_g_ := getg()
 
@@ -3247,14 +3290,14 @@ func newproc(siz int32, fn *funcval) {
 	gp := getg()
 	pc := getcallerpc()
 	systemstack(func() {
-		newproc1(fn, (*uint8)(argp), siz, gp, pc)
+		newproc1(fn, argp, siz, gp, pc)
 	})
 }
 
 // Create a new g running fn with narg bytes of arguments starting
 // at argp. callerpc is the address of the go statement that created
 // this. The new g is put on the queue of g's waiting to run.
-func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintptr) {
+func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerpc uintptr) {
 	_g_ := getg()
 
 	if fn == nil {
@@ -3299,7 +3342,7 @@ func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintpt
 		spArg += sys.MinFrameSize
 	}
 	if narg > 0 {
-		memmove(unsafe.Pointer(spArg), unsafe.Pointer(argp), uintptr(narg))
+		memmove(unsafe.Pointer(spArg), argp, uintptr(narg))
 		// This is a stack-to-stack copy. If write barriers
 		// are enabled and the source stack is grey (the
 		// destination is always black), then perform a
@@ -3628,9 +3671,6 @@ func _GC()                        { _GC() }
 func _LostSIGPROFDuringAtomic64() { _LostSIGPROFDuringAtomic64() }
 func _VDSO()                      { _VDSO() }
 
-// Counts SIGPROFs received while in atomic64 critical section, on mips{,le}
-var lostAtomic64Count uint64
-
 // Called if we receive a SIGPROF signal.
 // Called by the signal handler, may run during STW.
 //go:nowritebarrierrec
@@ -3648,7 +3688,7 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 	if GOARCH == "mips" || GOARCH == "mipsle" || GOARCH == "arm" {
 		if f := findfunc(pc); f.valid() {
 			if hasPrefix(funcname(f), "runtime/internal/atomic") {
-				lostAtomic64Count++
+				cpuprof.lostAtomic++
 				return
 			}
 		}
@@ -3788,10 +3828,6 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 	}
 
 	if prof.hz != 0 {
-		if (GOARCH == "mips" || GOARCH == "mipsle" || GOARCH == "arm") && lostAtomic64Count > 0 {
-			cpuprof.addLostAtomic64(lostAtomic64Count)
-			lostAtomic64Count = 0
-		}
 		cpuprof.add(gp, stk[:n])
 	}
 	getg().m.mallocing--
@@ -5212,15 +5248,6 @@ func doInit(t *initTask) {
 		throw("recursive call during initialization - linker skew")
 	default: // not initialized yet
 		t.state = 1 // initialization in progress
-		if raceenabled {
-			// Randomize initialization order of packages t depends on.
-			// TODO: enable always instead of just for race?
-			s := *(*[]uintptr)(unsafe.Pointer(&slice{array: add(unsafe.Pointer(t), 3*sys.PtrSize), len: int(t.ndeps), cap: int(t.ndeps)}))
-			for i := len(s) - 1; i > 0; i-- {
-				j := int(fastrandn(uint32(i + 1)))
-				s[i], s[j] = s[j], s[i]
-			}
-		}
 		for i := uintptr(0); i < t.ndeps; i++ {
 			p := add(unsafe.Pointer(t), (3+i)*sys.PtrSize)
 			t2 := *(**initTask)(p)

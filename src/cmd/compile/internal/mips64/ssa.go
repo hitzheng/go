@@ -426,6 +426,12 @@ func ssaGenValue(s *gc.SSAGenState, v *ssa.Value) {
 		p4.Reg = mips.REG_R1
 		p4.To.Type = obj.TYPE_BRANCH
 		gc.Patch(p4, p2)
+	case ssa.OpMIPS64DUFFCOPY:
+		p := s.Prog(obj.ADUFFCOPY)
+		p.To.Type = obj.TYPE_MEM
+		p.To.Name = obj.NAME_EXTERN
+		p.To.Sym = gc.Duffcopy
+		p.To.Offset = v.AuxInt
 	case ssa.OpMIPS64LoweredMove:
 		// SUBV	$8, R1
 		// MOVV	8(R1), Rtmp
@@ -823,11 +829,11 @@ func ssaGenBlock(s *gc.SSAGenState, b, next *ssa.Block) {
 				s.Br(obj.AJMP, b.Succs[0].Block())
 			}
 		}
-		if !b.Control.Type.IsFlags() {
+		if !b.Controls[0].Type.IsFlags() {
 			p.From.Type = obj.TYPE_REG
-			p.From.Reg = b.Control.Reg()
+			p.From.Reg = b.Controls[0].Reg()
 		}
 	default:
-		b.Fatalf("branch not implemented: %s. Control: %s", b.LongString(), b.Control.LongString())
+		b.Fatalf("branch not implemented: %s", b.LongString())
 	}
 }

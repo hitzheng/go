@@ -8,9 +8,6 @@ import "bytes"
 
 // Compact appends to dst the JSON-encoded src with
 // insignificant space characters elided.
-// Like Marshal, Compact applies HTMLEscape to any
-// string literals so that the JSON will be safe to embed
-// inside HTML <script> tags.
 func Compact(dst *bytes.Buffer, src []byte) error {
 	return compact(dst, src, false)
 }
@@ -31,7 +28,7 @@ func compact(dst *bytes.Buffer, src []byte, escape bool) error {
 			start = i + 1
 		}
 		// Convert U+2028 and U+2029 (E2 80 A8 and E2 80 A9).
-		if c == 0xE2 && i+2 < len(src) && src[i+1] == 0x80 && src[i+2]&^1 == 0xA8 {
+		if escape && c == 0xE2 && i+2 < len(src) && src[i+1] == 0x80 && src[i+2]&^1 == 0xA8 {
 			if start < i {
 				dst.Write(src[start:i])
 			}

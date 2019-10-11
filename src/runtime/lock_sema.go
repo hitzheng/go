@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin nacl netbsd openbsd plan9 solaris windows
+// +build aix darwin netbsd openbsd plan9 solaris windows
 
 package runtime
 
@@ -122,7 +122,13 @@ func unlock(l *mutex) {
 
 // One-time notifications.
 func noteclear(n *note) {
-	n.key = 0
+	if GOOS == "aix" {
+		// On AIX, semaphores might not synchronize the memory in some
+		// rare cases. See issue #30189.
+		atomic.Storeuintptr(&n.key, 0)
+	} else {
+		n.key = 0
+	}
 }
 
 func notewakeup(n *note) {

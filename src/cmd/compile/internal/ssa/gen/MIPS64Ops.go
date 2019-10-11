@@ -292,6 +292,24 @@ func init() {
 			faultOnNilArg0: true,
 		},
 
+		// duffcopy
+		// arg0 = address of dst memory (in R2, changed as side effect)
+		// arg1 = address of src memory (in R1, changed as side effect)
+		// arg2 = mem
+		// auxint = offset into duffcopy code to start executing
+		// returns mem
+		{
+			name:      "DUFFCOPY",
+			aux:       "Int64",
+			argLength: 3,
+			reg: regInfo{
+				inputs:   []regMask{buildReg("R2"), buildReg("R1")},
+				clobbers: buildReg("R1 R2 R31"),
+			},
+			faultOnNilArg0: true,
+			faultOnNilArg1: true,
+		},
+
 		// large or unaligned zeroing
 		// arg0 = address of memory to zero (in R1, changed as side effect)
 		// arg1 = address of the last element to zero
@@ -435,14 +453,14 @@ func init() {
 	}
 
 	blocks := []blockData{
-		{name: "EQ"},
-		{name: "NE"},
-		{name: "LTZ"}, // < 0
-		{name: "LEZ"}, // <= 0
-		{name: "GTZ"}, // > 0
-		{name: "GEZ"}, // >= 0
-		{name: "FPT"}, // FP flag is true
-		{name: "FPF"}, // FP flag is false
+		{name: "EQ", controls: 1},
+		{name: "NE", controls: 1},
+		{name: "LTZ", controls: 1}, // < 0
+		{name: "LEZ", controls: 1}, // <= 0
+		{name: "GTZ", controls: 1}, // > 0
+		{name: "GEZ", controls: 1}, // >= 0
+		{name: "FPT", controls: 1}, // FP flag is true
+		{name: "FPF", controls: 1}, // FP flag is false
 	}
 
 	archs = append(archs, arch{

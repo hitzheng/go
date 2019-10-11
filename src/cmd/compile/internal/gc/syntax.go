@@ -12,6 +12,7 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"cmd/internal/src"
+	"sort"
 )
 
 // A Node is a single node in the syntax tree.
@@ -47,6 +48,7 @@ type Node struct {
 	// - OSTRUCTKEY uses it to store the named field's offset.
 	// - Named OLITERALs use it to store their ambient iota value.
 	// - OINLMARK stores an index into the inlTree data structure.
+	// - OCLOSURE uses it to store ambient iota value, if any.
 	// Possibly still more uses. If you find any, document them.
 	Xoffset int64
 
@@ -149,7 +151,7 @@ const (
 	_, nodeDiag      // already printed error about this
 	_, nodeColas     // OAS resulting from :=
 	_, nodeNonNil    // guaranteed to be non-nil
-	_, nodeNoescape  // func arguments do not escape; TODO(rsc): move Noescape to Func struct (see CL 7360)
+	_, nodeTransient // storage can be reused immediately after this statement
 	_, nodeBounded   // bounds check unnecessary
 	_, nodeAddable   // addressable
 	_, nodeHasCall   // expression contains a function call
@@ -177,7 +179,7 @@ func (n *Node) IsDDD() bool                 { return n.flags&nodeIsDDD != 0 }
 func (n *Node) Diag() bool                  { return n.flags&nodeDiag != 0 }
 func (n *Node) Colas() bool                 { return n.flags&nodeColas != 0 }
 func (n *Node) NonNil() bool                { return n.flags&nodeNonNil != 0 }
-func (n *Node) Noescape() bool              { return n.flags&nodeNoescape != 0 }
+func (n *Node) Transient() bool             { return n.flags&nodeTransient != 0 }
 func (n *Node) Bounded() bool               { return n.flags&nodeBounded != 0 }
 func (n *Node) Addable() bool               { return n.flags&nodeAddable != 0 }
 func (n *Node) HasCall() bool               { return n.flags&nodeHasCall != 0 }
@@ -204,7 +206,7 @@ func (n *Node) SetIsDDD(b bool)                 { n.flags.set(nodeIsDDD, b) }
 func (n *Node) SetDiag(b bool)                  { n.flags.set(nodeDiag, b) }
 func (n *Node) SetColas(b bool)                 { n.flags.set(nodeColas, b) }
 func (n *Node) SetNonNil(b bool)                { n.flags.set(nodeNonNil, b) }
-func (n *Node) SetNoescape(b bool)              { n.flags.set(nodeNoescape, b) }
+func (n *Node) SetTransient(b bool)             { n.flags.set(nodeTransient, b) }
 func (n *Node) SetBounded(b bool)               { n.flags.set(nodeBounded, b) }
 func (n *Node) SetAddable(b bool)               { n.flags.set(nodeAddable, b) }
 func (n *Node) SetHasCall(b bool)               { n.flags.set(nodeHasCall, b) }
@@ -280,7 +282,7 @@ func (n *Node) isMethodExpression() bool {
 	return n.Op == ONAME && n.Left != nil && n.Left.Op == OTYPE && n.Right != nil && n.Right.Op == ONAME
 }
 
-// funcname returns the name of the function n.
+// funcname returns the name (without the package) of the function n.
 func (n *Node) funcname() string {
 	if n == nil || n.Func == nil || n.Func.Nname == nil {
 		return "<nil>"
@@ -598,10 +600,10 @@ const (
 	OSTR2RUNES    // Type(Left) (Type is []rune, Left is a string)
 	OAS           // Left = Right or (if Colas=true) Left := Right
 	OAS2          // List = Rlist (x, y, z = a, b, c)
-	OAS2FUNC      // List = Rlist (x, y = f())
-	OAS2RECV      // List = Rlist (x, ok = <-c)
-	OAS2MAPR      // List = Rlist (x, ok = m["foo"])
-	OAS2DOTTYPE   // List = Rlist (x, ok = I.(int))
+	OAS2DOTTYPE   // List = Right (x, ok = I.(int))
+	OAS2FUNC      // List = Right (x, y = f())
+	OAS2MAPR      // List = Right (x, ok = m["foo"])
+	OAS2RECV      // List = Right (x, ok = <-c)
 	OASOP         // Left Etype= Right (x += y)
 	OCALL         // Left(List) (function call, method call or type conversion)
 
@@ -690,7 +692,7 @@ const (
 	ORECV        // <-Left
 	ORUNESTR     // Type(Left) (Type is string, Left is rune)
 	OSELRECV     // Left = <-Right.Left: (appears as .Left of OCASE; Right.Op == ORECV)
-	OSELRECV2    // List = <-Right.Left: (apperas as .Left of OCASE; count(List) == 2, Right.Op == ORECV)
+	OSELRECV2    // List = <-Right.Left: (appears as .Left of OCASE; count(List) == 2, Right.Op == ORECV)
 	OIOTA        // iota
 	OREAL        // real(Left)
 	OIMAG        // imag(Left)
@@ -702,8 +704,7 @@ const (
 	// statements
 	OBLOCK    // { List } (block of code)
 	OBREAK    // break [Sym]
-	OCASE     // case Left or List[0]..List[1]: Nbody (select case after processing; Left==nil and List==nil means default)
-	OXCASE    // case List: Nbody (select case before processing; List==nil means default)
+	OCASE     // case List: Nbody (List==nil means default)
 	OCONTINUE // continue [Sym]
 	ODEFER    // defer Left (Left must be call)
 	OEMPTY    // no-op (empty statement)
@@ -725,8 +726,8 @@ const (
 	OGO     // go Left (Left must be call)
 	ORANGE  // for List = range Right { Nbody }
 	ORETURN // return List
-	OSELECT // select { List } (List is list of OXCASE or OCASE)
-	OSWITCH // switch Ninit; Left { List } (List is a list of OXCASE or OCASE)
+	OSELECT // select { List } (List is list of OCASE)
+	OSWITCH // switch Ninit; Left { List } (List is a list of OCASE)
 	OTYPESW // Left = Right.(type) (appears as .Left of OSWITCH)
 
 	// types
@@ -969,4 +970,31 @@ func (q *nodeQueue) popLeft() *Node {
 	n := q.ring[q.head%len(q.ring)]
 	q.head++
 	return n
+}
+
+// NodeSet is a set of Nodes.
+type NodeSet map[*Node]struct{}
+
+// Has reports whether s contains n.
+func (s NodeSet) Has(n *Node) bool {
+	_, isPresent := s[n]
+	return isPresent
+}
+
+// Add adds n to s.
+func (s *NodeSet) Add(n *Node) {
+	if *s == nil {
+		*s = make(map[*Node]struct{})
+	}
+	(*s)[n] = struct{}{}
+}
+
+// Sorted returns s sorted according to less.
+func (s NodeSet) Sorted(less func(*Node, *Node) bool) []*Node {
+	var res []*Node
+	for n := range s {
+		res = append(res, n)
+	}
+	sort.Slice(res, func(i, j int) bool { return less(res[i], res[j]) })
+	return res
 }

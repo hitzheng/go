@@ -11,7 +11,6 @@ import (
 	"cmd/link/internal/sym"
 	"io"
 	"regexp"
-	"runtime"
 )
 
 const (
@@ -102,10 +101,11 @@ func asmb2(ctxt *ld.Link) {
 	}
 
 	types := []*wasmFuncType{
-		// For normal Go functions the return value is
+		// For normal Go functions, the single parameter is PC_B,
+		// the return value is
 		// 0 if the function returned normally or
 		// 1 if the stack needs to be unwound.
-		{Results: []byte{I32}},
+		{Params: []byte{I32}, Results: []byte{I32}},
 	}
 
 	// collect host imports (functions that get imported from the WebAssembly host, usually JavaScript)
@@ -176,7 +176,6 @@ func asmb2(ctxt *ld.Link) {
 		writeBuildID(ctxt, buildid)
 	}
 
-	writeGoVersion(ctxt)
 	writeTypeSec(ctxt, types)
 	writeImportSec(ctxt, hostImports)
 	writeFunctionSec(ctxt, fns)
@@ -187,6 +186,7 @@ func asmb2(ctxt *ld.Link) {
 	writeElementSec(ctxt, uint64(len(hostImports)), uint64(len(fns)))
 	writeCodeSec(ctxt, fns)
 	writeDataSec(ctxt)
+	writeProducerSec(ctxt)
 	if !*ld.FlagS {
 		writeNameSec(ctxt, len(hostImports), fns)
 	}
@@ -222,13 +222,6 @@ func writeBuildID(ctxt *ld.Link, buildid []byte) {
 	sizeOffset := writeSecHeader(ctxt, sectionCustom)
 	writeName(ctxt.Out, "go.buildid")
 	ctxt.Out.Write(buildid)
-	writeSecSize(ctxt, sizeOffset)
-}
-
-func writeGoVersion(ctxt *ld.Link) {
-	sizeOffset := writeSecHeader(ctxt, sectionCustom)
-	writeName(ctxt.Out, "go.version")
-	ctxt.Out.Write([]byte(runtime.Version()))
 	writeSecSize(ctxt, sizeOffset)
 }
 
@@ -303,10 +296,11 @@ func writeTableSec(ctxt *ld.Link, fns []*wasmFunc) {
 func writeMemorySec(ctxt *ld.Link) {
 	sizeOffset := writeSecHeader(ctxt, sectionMemory)
 
-	const (
-		initialSize  = 16 << 20 // 16MB, enough for runtime init without growing
-		wasmPageSize = 64 << 10 // 64KB
-	)
+	dataSection := ctxt.Syms.Lookup("runtime.data", 0).Sect
+	dataEnd := dataSection.Vaddr + dataSection.Length
+	var initialSize = dataEnd + 16<<20 // 16MB, enough for runtime init without growing
+
+	const wasmPageSize = 64 << 10 // 64KB
 
 	writeUleb128(ctxt.Out, 1)                        // number of memories
 	ctxt.Out.WriteByte(0x00)                         // no maximum memory size
@@ -320,16 +314,14 @@ func writeGlobalSec(ctxt *ld.Link) {
 	sizeOffset := writeSecHeader(ctxt, sectionGlobal)
 
 	globalRegs := []byte{
-		I32, // 0: PC_F
-		I32, // 1: PC_B
-		I32, // 2: SP
-		I64, // 3: CTXT
-		I64, // 4: g
-		I64, // 5: RET0
-		I64, // 6: RET1
-		I64, // 7: RET2
-		I64, // 8: RET3
-		I32, // 9: PAUSE
+		I32, // 0: SP
+		I64, // 1: CTXT
+		I64, // 2: g
+		I64, // 3: RET0
+		I64, // 4: RET1
+		I64, // 5: RET2
+		I64, // 6: RET3
+		I32, // 7: PAUSE
 	}
 
 	writeUleb128(ctxt.Out, uint64(len(globalRegs))) // number of globals
@@ -485,6 +477,26 @@ func writeDataSec(ctxt *ld.Link) {
 		writeUleb128(ctxt.Out, uint64(len(seg.data)))
 		ctxt.Out.Write(seg.data)
 	}
+
+	writeSecSize(ctxt, sizeOffset)
+}
+
+// writeProducerSec writes an optional section that reports the source language and compiler version.
+func writeProducerSec(ctxt *ld.Link) {
+	sizeOffset := writeSecHeader(ctxt, sectionCustom)
+	writeName(ctxt.Out, "producers")
+
+	writeUleb128(ctxt.Out, 2) // number of fields
+
+	writeName(ctxt.Out, "language")     // field name
+	writeUleb128(ctxt.Out, 1)           // number of values
+	writeName(ctxt.Out, "Go")           // value: name
+	writeName(ctxt.Out, objabi.Version) // value: version
+
+	writeName(ctxt.Out, "processed-by")   // field name
+	writeUleb128(ctxt.Out, 1)             // number of values
+	writeName(ctxt.Out, "Go cmd/compile") // value: name
+	writeName(ctxt.Out, objabi.Version)   // value: version
 
 	writeSecSize(ctxt, sizeOffset)
 }

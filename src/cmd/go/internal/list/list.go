@@ -287,7 +287,7 @@ For more about modules, see 'go help modules'.
 
 func init() {
 	CmdList.Run = runList // break init cycle
-	work.AddBuildFlags(CmdList)
+	work.AddBuildFlags(CmdList, work.DefaultBuildFlags)
 }
 
 var (
@@ -384,13 +384,16 @@ func runList(cmd *base.Command, args []string) {
 		if modload.Init(); !modload.Enabled() {
 			base.Fatalf("go list -m: not using modules")
 		}
+		if cfg.BuildMod == "vendor" {
+			base.Fatalf("go list -m: can't list modules with -mod=vendor\n\tuse -mod=mod or -mod=readonly to ignore the vendor directory")
+		}
 		modload.LoadBuildList()
 
 		mods := modload.ListModules(args, *listU, *listVersions)
 		if !*listE {
 			for _, m := range mods {
 				if m.Error != nil {
-					base.Errorf("go list -m %s: %v", m.Path, m.Error.Err)
+					base.Errorf("go list -m: %v", m.Error.Err)
 				}
 			}
 			base.ExitIfErrors()
@@ -459,7 +462,7 @@ func runList(cmd *base.Command, args []string) {
 				}
 				if pmain != nil {
 					pkgs = append(pkgs, pmain)
-					data := pmain.Internal.TestmainGo
+					data := *pmain.Internal.TestmainGo
 					h := cache.NewHash("testmain")
 					h.Write([]byte("testmain\n"))
 					h.Write(data)

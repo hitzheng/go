@@ -28,6 +28,7 @@ Scripts also have access to these other environment variables:
 
 	GOARCH=<target GOARCH>
 	GOCACHE=<actual GOCACHE being used outside the test>
+	GOEXE=<executable file suffix: .exe on Windows, empty on other systems>
 	GOOS=<target GOOS>
 	GOPATH=$WORK/gopath
 	GOPROXY=<local module proxy serving from cmd/go/testdata/mod>
@@ -37,8 +38,6 @@ Scripts also have access to these other environment variables:
 	TMPDIR=$WORK/tmp
 	devnull=<value of os.DevNull>
 	goversion=<current Go version; for example, 1.12>
-
-The environment variable $exe (lowercase) is an empty string on most systems, ".exe" on Windows.
 
 The scripts supporting files are unpacked relative to $GOPATH/src (aka $WORK/gopath/src)
 and then the script begins execution in that directory as well. Thus the example above runs
@@ -80,7 +79,9 @@ should only run when the condition is satisfied. The available conditions are:
    - [exec:prog] for whether prog is available for execution (found by exec.LookPath)
 
 A condition can be negated: [!short] means to run the rest of the line
-when testing.Short() is false.
+when testing.Short() is false. Multiple conditions may be given for a single
+command, for example, '[linux] [amd64] skip'. The command will run if all conditions
+are satisfied.
 
 The commands are:
 

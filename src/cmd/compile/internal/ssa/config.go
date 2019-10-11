@@ -25,6 +25,8 @@ type Config struct {
 	registers      []Register    // machine registers
 	gpRegMask      regMask       // general purpose integer register mask
 	fpRegMask      regMask       // floating point register mask
+	fp32RegMask    regMask       // floating point register mask
+	fp64RegMask    regMask       // floating point register mask
 	specialRegMask regMask       // special register mask
 	GCRegMap       []*Register   // garbage collector register map, by GC register index
 	FPReg          int8          // register number of frame pointer, -1 if not used
@@ -36,7 +38,6 @@ type Config struct {
 	useSSE         bool          // Use SSE for non-float operations
 	useAvg         bool          // Use optimizations that need Avg* operations
 	useHmul        bool          // Use optimizations that need Hmul* operations
-	nacl           bool          // GOOS=nacl
 	use387         bool          // GO386=387
 	SoftFloat      bool          //
 	Race           bool          // race detector enabled
@@ -209,19 +210,6 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize bool) *Config 
 		c.FPReg = framepointerRegAMD64
 		c.LinkReg = linkRegAMD64
 		c.hasGReg = false
-	case "amd64p32":
-		c.PtrSize = 4
-		c.RegSize = 8
-		c.lowerBlock = rewriteBlockAMD64
-		c.lowerValue = rewriteValueAMD64
-		c.splitLoad = rewriteValueAMD64splitload
-		c.registers = registersAMD64[:]
-		c.gpRegMask = gpRegMaskAMD64
-		c.fpRegMask = fpRegMaskAMD64
-		c.FPReg = framepointerRegAMD64
-		c.LinkReg = linkRegAMD64
-		c.hasGReg = false
-		c.noDuffDevice = true
 	case "386":
 		c.PtrSize = 4
 		c.RegSize = 4
@@ -324,6 +312,8 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize bool) *Config 
 		c.registers = registersWasm[:]
 		c.gpRegMask = gpRegMaskWasm
 		c.fpRegMask = fpRegMaskWasm
+		c.fp32RegMask = fp32RegMaskWasm
+		c.fp64RegMask = fp64RegMaskWasm
 		c.FPReg = framepointerRegWasm
 		c.LinkReg = linkRegWasm
 		c.hasGReg = true
@@ -335,7 +325,6 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize bool) *Config 
 	}
 	c.ctxt = ctxt
 	c.optimize = optimize
-	c.nacl = objabi.GOOS == "nacl"
 	c.useSSE = true
 
 	// Don't use Duff's device nor SSE on Plan 9 AMD64, because
@@ -343,17 +332,6 @@ func NewConfig(arch string, types Types, ctxt *obj.Link, optimize bool) *Config 
 	if objabi.GOOS == "plan9" && arch == "amd64" {
 		c.noDuffDevice = true
 		c.useSSE = false
-	}
-
-	if c.nacl {
-		c.noDuffDevice = true // Don't use Duff's device on NaCl
-
-		// Returns clobber BP on nacl/386, so the write
-		// barrier does.
-		opcodeTable[Op386LoweredWB].reg.clobbers |= 1 << 5 // BP
-
-		// ... and SI on nacl/amd64.
-		opcodeTable[OpAMD64LoweredWB].reg.clobbers |= 1 << 6 // SI
 	}
 
 	if ctxt.Flag_shared {

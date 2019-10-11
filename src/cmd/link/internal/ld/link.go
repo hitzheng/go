@@ -67,6 +67,7 @@ type Link struct {
 	linkShared    bool // link against installed Go shared libraries
 	LinkMode      LinkMode
 	BuildMode     BuildMode
+	canUsePlugins bool // initialized when Loaded is set to true
 	compressDWARF bool
 
 	Tlsg         *sym.Symbol
@@ -91,8 +92,8 @@ type Link struct {
 	// Used to implement field tracking.
 	Reachparent map[*sym.Symbol]*sym.Symbol
 
-	compUnits         []*compilationUnit // DWARF compilation units
-	compUnitByPackage map[*sym.Library]*compilationUnit
+	compUnits []*sym.CompilationUnit // DWARF compilation units
+	runtimeCU *sym.CompilationUnit   // One of the runtime CUs, the last one seen.
 
 	relocbuf []byte // temporary buffer for applying relocations
 }

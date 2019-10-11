@@ -5,6 +5,7 @@
 package ssa
 
 import (
+	"cmd/internal/src"
 	"fmt"
 	"math"
 )
@@ -530,6 +531,25 @@ func (ft *factsTable) update(parent *Block, v, w *Value, d domain, r relation) {
 		}
 	}
 
+	// Look through value-preserving extensions.
+	// If the domain is appropriate for the pre-extension Type,
+	// repeat the update with the pre-extension Value.
+	if isCleanExt(v) {
+		switch {
+		case d == signed && v.Args[0].Type.IsSigned():
+			fallthrough
+		case d == unsigned && !v.Args[0].Type.IsSigned():
+			ft.update(parent, v.Args[0], w, d, r)
+		}
+	}
+	if isCleanExt(w) {
+		switch {
+		case d == signed && w.Args[0].Type.IsSigned():
+			fallthrough
+		case d == unsigned && !w.Args[0].Type.IsSigned():
+			ft.update(parent, v, w.Args[0], d, r)
+		}
+	}
 }
 
 var opMin = map[Op]int64{
@@ -553,21 +573,40 @@ func (ft *factsTable) isNonNegative(v *Value) bool {
 		return true
 	}
 
+	var max int64
+	switch v.Type.Size() {
+	case 1:
+		max = math.MaxInt8
+	case 2:
+		max = math.MaxInt16
+	case 4:
+		max = math.MaxInt32
+	case 8:
+		max = math.MaxInt64
+	default:
+		panic("unexpected integer size")
+	}
+
 	// Check if the recorded limits can prove that the value is positive
-	if l, has := ft.limits[v.ID]; has && (l.min >= 0 || l.umax <= math.MaxInt64) {
+	if l, has := ft.limits[v.ID]; has && (l.min >= 0 || l.umax <= uint64(max)) {
 		return true
 	}
 
 	// Check if v = x+delta, and we can use x's limits to prove that it's positive
 	if x, delta := isConstDelta(v); x != nil {
 		if l, has := ft.limits[x.ID]; has {
-			if delta > 0 && l.min >= -delta && l.max <= math.MaxInt64-delta {
+			if delta > 0 && l.min >= -delta && l.max <= max-delta {
 				return true
 			}
 			if delta < 0 && l.min >= -delta {
 				return true
 			}
 		}
+	}
+
+	// Check if v is a value-preserving extension of a non-negative value.
+	if isCleanExt(v) && ft.isNonNegative(v.Args[0]) {
+		return true
 	}
 
 	// Check if the signed poset can prove that the value is >= 0
@@ -738,6 +777,8 @@ func prove(f *Func) {
 	ft := newFactsTable(f)
 	ft.checkpoint()
 
+	var lensVars map[*Block][]*Value
+
 	// Find length and capacity ops.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
@@ -755,12 +796,24 @@ func prove(f *Func) {
 				}
 				ft.lens[v.Args[0].ID] = v
 				ft.update(b, v, ft.zero, signed, gt|eq)
+				if v.Args[0].Op == OpSliceMake {
+					if lensVars == nil {
+						lensVars = make(map[*Block][]*Value)
+					}
+					lensVars[b] = append(lensVars[b], v)
+				}
 			case OpSliceCap:
 				if ft.caps == nil {
 					ft.caps = map[ID]*Value{}
 				}
 				ft.caps[v.Args[0].ID] = v
 				ft.update(b, v, ft.zero, signed, gt|eq)
+				if v.Args[0].Op == OpSliceMake {
+					if lensVars == nil {
+						lensVars = make(map[*Block][]*Value)
+					}
+					lensVars[b] = append(lensVars[b], v)
+				}
 			}
 		}
 	}
@@ -814,8 +867,21 @@ func prove(f *Func) {
 		switch node.state {
 		case descend:
 			ft.checkpoint()
+
+			// Entering the block, add the block-depending facts that we collected
+			// at the beginning: induction variables and lens/caps of slices.
 			if iv, ok := indVars[node.block]; ok {
 				addIndVarRestrictions(ft, parent, iv)
+			}
+			if lens, ok := lensVars[node.block]; ok {
+				for _, v := range lens {
+					switch v.Op {
+					case OpSliceLen:
+						ft.update(node.block, v, v.Args[0].Args[1], signed, eq)
+					case OpSliceCap:
+						ft.update(node.block, v, v.Args[0].Args[2], signed, eq)
+					}
+				}
 			}
 
 			if branch != unknown {
@@ -914,7 +980,7 @@ func addIndVarRestrictions(ft *factsTable, b *Block, iv indVar) {
 // addBranchRestrictions updates the factsTables ft with the facts learned when
 // branching from Block b in direction br.
 func addBranchRestrictions(ft *factsTable, b *Block, br branch) {
-	c := b.Control
+	c := b.Controls[0]
 	switch br {
 	case negative:
 		addRestrictions(b, ft, boolean, nil, c, eq)
@@ -923,14 +989,14 @@ func addBranchRestrictions(ft *factsTable, b *Block, br branch) {
 	default:
 		panic("unknown branch")
 	}
-	if tr, has := domainRelationTable[b.Control.Op]; has {
+	if tr, has := domainRelationTable[c.Op]; has {
 		// When we branched from parent we learned a new set of
 		// restrictions. Update the factsTable accordingly.
 		d := tr.d
 		if d == signed && ft.isNonNegative(c.Args[0]) && ft.isNonNegative(c.Args[1]) {
 			d |= unsigned
 		}
-		switch b.Control.Op {
+		switch c.Op {
 		case OpIsInBounds, OpIsSliceInBounds:
 			// 0 <= a0 < a1 (or 0 <= a0 <= a1)
 			//
@@ -1031,6 +1097,7 @@ func addLocalInductiveFacts(ft *factsTable, b *Block) {
 			if pred.Kind != BlockIf {
 				continue
 			}
+			control := pred.Controls[0]
 
 			br := unknown
 			if pred.Succs[0].b == child {
@@ -1043,7 +1110,7 @@ func addLocalInductiveFacts(ft *factsTable, b *Block) {
 				br = negative
 			}
 
-			tr, has := domainRelationTable[pred.Control.Op]
+			tr, has := domainRelationTable[control.Op]
 			if !has {
 				continue
 			}
@@ -1056,10 +1123,10 @@ func addLocalInductiveFacts(ft *factsTable, b *Block) {
 
 			// Check for i2 < max or max > i2.
 			var max *Value
-			if r == lt && pred.Control.Args[0] == i2 {
-				max = pred.Control.Args[1]
-			} else if r == gt && pred.Control.Args[1] == i2 {
-				max = pred.Control.Args[0]
+			if r == lt && control.Args[0] == i2 {
+				max = control.Args[1]
+			} else if r == gt && control.Args[1] == i2 {
+				max = control.Args[0]
 			} else {
 				continue
 			}
@@ -1218,20 +1285,24 @@ func simplifyBlock(sdom SparseTree, ft *factsTable, b *Block) {
 }
 
 func removeBranch(b *Block, branch branch) {
+	c := b.Controls[0]
 	if b.Func.pass.debug > 0 {
 		verb := "Proved"
 		if branch == positive {
 			verb = "Disproved"
 		}
-		c := b.Control
 		if b.Func.pass.debug > 1 {
 			b.Func.Warnl(b.Pos, "%s %s (%s)", verb, c.Op, c)
 		} else {
 			b.Func.Warnl(b.Pos, "%s %s", verb, c.Op)
 		}
 	}
+	if c != nil && c.Pos.IsStmt() == src.PosIsStmt && c.Pos.SameFileAndLine(b.Pos) {
+		// attempt to preserve statement marker.
+		b.Pos = b.Pos.WithIsStmt()
+	}
 	b.Kind = BlockFirst
-	b.SetControl(nil)
+	b.ResetControls()
 	if branch == positive {
 		b.swapSuccessors()
 	}
@@ -1284,4 +1355,21 @@ func isConstDelta(v *Value) (w *Value, delta int64) {
 		}
 	}
 	return nil, 0
+}
+
+// isCleanExt reports whether v is the result of a value-preserving
+// sign or zero extension
+func isCleanExt(v *Value) bool {
+	switch v.Op {
+	case OpSignExt8to16, OpSignExt8to32, OpSignExt8to64,
+		OpSignExt16to32, OpSignExt16to64, OpSignExt32to64:
+		// signed -> signed is the only value-preserving sign extension
+		return v.Args[0].Type.IsSigned() && v.Type.IsSigned()
+
+	case OpZeroExt8to16, OpZeroExt8to32, OpZeroExt8to64,
+		OpZeroExt16to32, OpZeroExt16to64, OpZeroExt32to64:
+		// unsigned -> signed/unsigned are value-preserving zero extensions
+		return !v.Args[0].Type.IsSigned()
+	}
+	return false
 }

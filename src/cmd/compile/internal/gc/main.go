@@ -187,8 +187,11 @@ func Main(archInit func(*Arch)) {
 	// pseudo-package used for methods with anonymous receivers
 	gopkg = types.NewPkg("go", "")
 
-	Nacl = objabi.GOOS == "nacl"
 	Wasm := objabi.GOARCH == "wasm"
+
+	// Whether the limit for stack-allocated objects is much smaller than normal.
+	// This can be helpful for diagnosing certain causes of GC latency. See #27732.
+	smallFrames := false
 
 	flag.BoolVar(&compiling_runtime, "+", false, "compiling runtime")
 	flag.BoolVar(&compiling_std, "std", false, "compiling standard library")
@@ -234,7 +237,6 @@ func Main(archInit func(*Arch)) {
 	if sys.RaceDetectorSupported(objabi.GOOS, objabi.GOARCH) {
 		flag.BoolVar(&flag_race, "race", false, "enable race detector")
 	}
-	objabi.Flagcount("s", "warn about composite literals that can be simplified", &Debug['s'])
 	if enableTrace {
 		flag.BoolVar(&trace, "t", false, "trace type-checking")
 	}
@@ -255,19 +257,23 @@ func Main(archInit func(*Arch)) {
 	flag.StringVar(&goversion, "goversion", "", "required version of the runtime")
 	var symabisPath string
 	flag.StringVar(&symabisPath, "symabis", "", "read symbol ABIs from `file`")
-	flag.BoolVar(&allABIs, "allabis", false, "generate ABI wrappers for all symbols (for bootstrap)")
 	flag.StringVar(&traceprofile, "traceprofile", "", "write an execution trace to `file`")
 	flag.StringVar(&blockprofile, "blockprofile", "", "write block profile to `file`")
 	flag.StringVar(&mutexprofile, "mutexprofile", "", "write mutex profile to `file`")
 	flag.StringVar(&benchfile, "bench", "", "append benchmark times to `file`")
-	flag.BoolVar(&newescape, "newescape", true, "enable new escape analysis")
+	flag.BoolVar(&smallFrames, "smallframes", false, "reduce the size limit for stack allocated objects")
 	flag.BoolVar(&Ctxt.UseBASEntries, "dwarfbasentries", Ctxt.UseBASEntries, "use base address selection entries in DWARF")
 	objabi.Flagparse(usage)
 
 	// Record flags that affect the build result. (And don't
 	// record flags that don't, since that would cause spurious
 	// changes in the binary.)
-	recordFlags("B", "N", "l", "msan", "race", "shared", "dynlink", "dwarflocationlists", "newescape", "dwarfbasentries")
+	recordFlags("B", "N", "l", "msan", "race", "shared", "dynlink", "dwarflocationlists", "dwarfbasentries", "smallframes")
+
+	if smallFrames {
+		maxStackVarSize = 128 * 1024
+		maxImplicitStackVarSize = 16 * 1024
+	}
 
 	Ctxt.Flag_shared = flag_dynlink || flag_shared
 	Ctxt.Flag_dynlink = flag_dynlink
@@ -519,7 +525,6 @@ func Main(archInit func(*Arch)) {
 	//   We also defer type alias declarations until phase 2
 	//   to avoid cycles like #18640.
 	//   TODO(gri) Remove this again once we have a fix for #25838.
-	defercheckwidth()
 
 	// Don't use range--typecheck can add closures to xtop.
 	timings.Start("fe", "typecheck", "top1")
@@ -541,7 +546,6 @@ func Main(archInit func(*Arch)) {
 			xtop[i] = typecheck(n, ctxStmt)
 		}
 	}
-	resumecheckwidth()
 
 	// Phase 3: Type check function bodies.
 	// Don't use range--typecheck can add closures to xtop.
@@ -564,7 +568,7 @@ func Main(archInit func(*Arch)) {
 			fcount++
 		}
 	}
-	// With all types ckecked, it's now safe to verify map keys. One single
+	// With all types checked, it's now safe to verify map keys. One single
 	// check past phase 9 isn't sufficient, as we may exit with other errors
 	// before then, thus skipping map key errors.
 	checkMapKeys()
@@ -839,11 +843,6 @@ func readImportCfg(file string) {
 // name, where the local package prefix is always `"".`
 var symabiDefs, symabiRefs map[string]obj.ABI
 
-// allABIs indicates that all symbol definitions should have ABI
-// wrappers. This is used during toolchain bootstrapping to avoid
-// having to find cross-package references.
-var allABIs bool
-
 // readSymABIs reads a symabis file that specifies definitions and
 // references of text symbols by ABI.
 //
@@ -1032,7 +1031,6 @@ func loadsys() {
 
 	inimport = true
 	typecheckok = true
-	defercheckwidth()
 
 	typs := runtimeTypes()
 	for _, d := range runtimeDecls {
@@ -1049,7 +1047,6 @@ func loadsys() {
 	}
 
 	typecheckok = false
-	resumecheckwidth()
 	inimport = false
 }
 

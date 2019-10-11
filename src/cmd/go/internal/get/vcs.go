@@ -112,7 +112,7 @@ var vcsHg = &vcsCmd{
 	name: "Mercurial",
 	cmd:  "hg",
 
-	createCmd:   []string{"clone -U {repo} {dir}"},
+	createCmd:   []string{"clone -U -- {repo} {dir}"},
 	downloadCmd: []string{"pull"},
 
 	// We allow both tag and branch names as 'tags'
@@ -128,7 +128,7 @@ var vcsHg = &vcsCmd{
 	tagSyncDefault: []string{"update default"},
 
 	scheme:     []string{"https", "http", "ssh"},
-	pingCmd:    "identify {scheme}://{repo}",
+	pingCmd:    "identify -- {scheme}://{repo}",
 	remoteRepo: hgRemoteRepo,
 }
 
@@ -145,7 +145,7 @@ var vcsGit = &vcsCmd{
 	name: "Git",
 	cmd:  "git",
 
-	createCmd:   []string{"clone {repo} {dir}", "-go-internal-cd {dir} submodule update --init --recursive"},
+	createCmd:   []string{"clone -- {repo} {dir}", "-go-internal-cd {dir} submodule update --init --recursive"},
 	downloadCmd: []string{"pull --ff-only", "submodule update --init --recursive"},
 
 	tagCmd: []tagCmd{
@@ -164,8 +164,14 @@ var vcsGit = &vcsCmd{
 	// See golang.org/issue/9032.
 	tagSyncDefault: []string{"submodule update --init --recursive"},
 
-	scheme:     []string{"git", "https", "http", "git+ssh", "ssh"},
-	pingCmd:    "ls-remote {scheme}://{repo}",
+	scheme: []string{"git", "https", "http", "git+ssh", "ssh"},
+
+	// Leave out the '--' separator in the ls-remote command: git 2.7.4 does not
+	// support such a separator for that command, and this use should be safe
+	// without it because the {scheme} value comes from the predefined list above.
+	// See golang.org/issue/33836.
+	pingCmd: "ls-remote {scheme}://{repo}",
+
 	remoteRepo: gitRemoteRepo,
 }
 
@@ -222,7 +228,7 @@ var vcsBzr = &vcsCmd{
 	name: "Bazaar",
 	cmd:  "bzr",
 
-	createCmd: []string{"branch {repo} {dir}"},
+	createCmd: []string{"branch -- {repo} {dir}"},
 
 	// Without --overwrite bzr will not pull tags that changed.
 	// Replace by --overwrite-tags after http://pad.lv/681792 goes in.
@@ -233,7 +239,7 @@ var vcsBzr = &vcsCmd{
 	tagSyncDefault: []string{"update -r revno:-1"},
 
 	scheme:      []string{"https", "http", "bzr", "bzr+ssh"},
-	pingCmd:     "info {scheme}://{repo}",
+	pingCmd:     "info -- {scheme}://{repo}",
 	remoteRepo:  bzrRemoteRepo,
 	resolveRepo: bzrResolveRepo,
 }
@@ -284,14 +290,14 @@ var vcsSvn = &vcsCmd{
 	name: "Subversion",
 	cmd:  "svn",
 
-	createCmd:   []string{"checkout {repo} {dir}"},
+	createCmd:   []string{"checkout -- {repo} {dir}"},
 	downloadCmd: []string{"update"},
 
 	// There is no tag command in subversion.
 	// The branch information is all in the path names.
 
 	scheme:     []string{"https", "http", "svn", "svn+ssh"},
-	pingCmd:    "info {scheme}://{repo}",
+	pingCmd:    "info -- {scheme}://{repo}",
 	remoteRepo: svnRemoteRepo,
 }
 
@@ -334,7 +340,7 @@ var vcsFossil = &vcsCmd{
 	name: "Fossil",
 	cmd:  "fossil",
 
-	createCmd:   []string{"-go-internal-mkdir {dir} clone {repo} " + filepath.Join("{dir}", fossilRepoName), "-go-internal-cd {dir} open .fossil"},
+	createCmd:   []string{"-go-internal-mkdir {dir} clone -- {repo} " + filepath.Join("{dir}", fossilRepoName), "-go-internal-cd {dir} open .fossil"},
 	downloadCmd: []string{"up"},
 
 	tagCmd:         []tagCmd{{"tag ls", `(.*)`}},
@@ -655,7 +661,7 @@ func RepoRootForImportPath(importPath string, mod ModuleMode, security web.Secur
 	if err == errUnknownSite {
 		rr, err = repoRootForImportDynamic(importPath, mod, security)
 		if err != nil {
-			err = fmt.Errorf("unrecognized import path %q (%v)", importPath, err)
+			err = fmt.Errorf("unrecognized import path %q: %v", importPath, err)
 		}
 	}
 	if err != nil {
@@ -793,6 +799,13 @@ func repoRootForImportDynamic(importPath string, mod ModuleMode, security web.Se
 	body := resp.Body
 	defer body.Close()
 	imports, err := parseMetaGoImports(body, mod)
+	if len(imports) == 0 {
+		if respErr := resp.Err(); respErr != nil {
+			// If the server's status was not OK, prefer to report that instead of
+			// an XML parse error.
+			return nil, respErr
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("parsing %s: %v", importPath, err)
 	}
@@ -856,6 +869,9 @@ func validateRepoRoot(repoRoot string) error {
 	if url.Scheme == "" {
 		return errors.New("no scheme")
 	}
+	if url.Scheme == "file" {
+		return errors.New("file scheme disallowed")
+	}
 	return nil
 }
 
@@ -895,16 +911,23 @@ func metaImportsForPrefix(importPrefix string, mod ModuleMode, security web.Secu
 		}
 		resp, err := web.Get(security, url)
 		if err != nil {
-			return setCache(fetchResult{url: url, err: fmt.Errorf("fetch %s: %v", resp.URL, err)})
+			return setCache(fetchResult{url: url, err: fmt.Errorf("fetching %s: %v", importPrefix, err)})
 		}
 		body := resp.Body
 		defer body.Close()
 		imports, err := parseMetaGoImports(body, mod)
+		if len(imports) == 0 {
+			if respErr := resp.Err(); respErr != nil {
+				// If the server's status was not OK, prefer to report that instead of
+				// an XML parse error.
+				return setCache(fetchResult{url: url, err: respErr})
+			}
+		}
 		if err != nil {
 			return setCache(fetchResult{url: url, err: fmt.Errorf("parsing %s: %v", resp.URL, err)})
 		}
 		if len(imports) == 0 {
-			err = fmt.Errorf("fetch %s: no go-import meta tag", url)
+			err = fmt.Errorf("fetching %s: no go-import meta tag found in %s", importPrefix, resp.URL)
 		}
 		return setCache(fetchResult{url: url, imports: imports, err: err})
 	})
@@ -953,7 +976,7 @@ func (m ImportMismatchError) Error() string {
 
 // matchGoImport returns the metaImport from imports matching importPath.
 // An error is returned if there are multiple matches.
-// errNoMatch is returned if none match.
+// An ImportMismatchError is returned if none match.
 func matchGoImport(imports []metaImport, importPath string) (metaImport, error) {
 	match := -1
 

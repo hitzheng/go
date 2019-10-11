@@ -491,11 +491,11 @@ type m struct {
 	schedlink     muintptr
 	mcache        *mcache
 	lockedg       guintptr
-	createstack   [32]uintptr    // stack that created this thread.
-	lockedExt     uint32         // tracking for external LockOSThread
-	lockedInt     uint32         // tracking for internal lockOSThread
-	nextwaitm     muintptr       // next m waiting for lock
-	waitunlockf   unsafe.Pointer // todo go func(*g, unsafe.pointer) bool
+	createstack   [32]uintptr // stack that created this thread.
+	lockedExt     uint32      // tracking for external LockOSThread
+	lockedInt     uint32      // tracking for internal lockOSThread
+	nextwaitm     muintptr    // next m waiting for lock
+	waitunlockf   func(*g, unsafe.Pointer) bool
 	waitlock      unsafe.Pointer
 	waittraceev   byte
 	waittraceskip int
@@ -726,7 +726,7 @@ type funcinl struct {
 // layout of Itab known to compilers
 // allocated in non-garbage-collected memory
 // Needs to be in sync with
-// ../cmd/compile/internal/gc/reflect.go:/^func.dumptypestructs.
+// ../cmd/compile/internal/gc/reflect.go:/^func.dumptabs.
 type itab struct {
 	inter *interfacetype
 	_type *_type
@@ -736,7 +736,7 @@ type itab struct {
 }
 
 // Lock-free stack node.
-// // Also known to export_test.go.
+// Also known to export_test.go.
 type lfnode struct {
 	next    uint64
 	pushcnt uintptr
@@ -775,9 +775,16 @@ func extendRandom(r []byte, n int) {
 
 // A _defer holds an entry on the list of deferred calls.
 // If you add a field here, add code to clear it in freedefer.
+// This struct must match the code in cmd/compile/internal/gc/reflect.go:deferstruct
+// and cmd/compile/internal/gc/ssa.go:(*state).call.
+// Some defers will be allocated on the stack and some on the heap.
+// All defers are logically part of the stack, so write barriers to
+// initialize them are not required. All defers must be manually scanned,
+// and for heap defers, marked.
 type _defer struct {
-	siz     int32
+	siz     int32 // includes both arguments and results
 	started bool
+	heap    bool
 	sp      uintptr // sp at time of defer
 	pc      uintptr
 	fn      *funcval
@@ -915,7 +922,7 @@ var (
 	// Information about what cpu features are available.
 	// Packages outside the runtime should not use these
 	// as they are not an external api.
-	// Set on startup in asm_{386,amd64,amd64p32}.s
+	// Set on startup in asm_{386,amd64}.s
 	processorVersionInfo uint32
 	isIntel              bool
 	lfenceBeforeRdtsc    bool

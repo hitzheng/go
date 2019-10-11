@@ -367,11 +367,9 @@ func Short() bool {
 	if short == nil {
 		panic("testing: Short called before Init")
 	}
-	// Catch code that calls this from TestMain without first
-	// calling flag.Parse. This shouldn't really be a panic.
+	// Catch code that calls this from TestMain without first calling flag.Parse.
 	if !flag.Parsed() {
-		fmt.Fprintf(os.Stderr, "testing: Short called before flag.Parse\n")
-		os.Exit(2)
+		panic("testing: Short called before Parse")
 	}
 
 	return *short
@@ -386,13 +384,12 @@ func CoverMode() string {
 
 // Verbose reports whether the -test.v flag is set.
 func Verbose() bool {
+	// Same as in Short.
 	if chatty == nil {
 		panic("testing: Verbose called before Init")
 	}
-	// Same as in Short.
 	if !flag.Parsed() {
-		fmt.Fprintf(os.Stderr, "testing: Verbose called before flag.Parse\n")
-		os.Exit(2)
+		panic("testing: Verbose called before Parse")
 	}
 	return *chatty
 }
@@ -774,7 +771,7 @@ func (c *common) Helper() {
 // for the caller after skip frames (where 0 means the current function).
 func callerName(skip int) string {
 	// Make room for the skip PC.
-	var pc [2]uintptr
+	var pc [1]uintptr
 	n := runtime.Callers(skip+2, pc[:]) // skip + runtime.Callers + callerName
 	if n == 0 {
 		panic("testing: zero callers found")
@@ -1078,11 +1075,6 @@ type testDeps interface {
 // It is not meant to be called directly and is not subject to the Go 1 compatibility document.
 // It may change signature from release to release.
 func MainStart(deps testDeps, tests []InternalTest, benchmarks []InternalBenchmark, examples []InternalExample) *M {
-	// In most cases, Init has already been called by the testinginit code
-	// that 'go test' injects into test packages.
-	// Call it again here to handle cases such as:
-	// - test packages that don't import "testing" (such as example-only packages)
-	// - direct use of MainStart (though that isn't well-supported)
 	Init()
 	return &M{
 		deps:       deps,

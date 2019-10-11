@@ -34,6 +34,7 @@ import (
 	"bufio"
 	"bytes"
 	"cmd/internal/bio"
+	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
 	"cmd/link/internal/loadelf"
@@ -173,12 +174,15 @@ func (ctxt *Link) DynlinkingGo() bool {
 	if !ctxt.Loaded {
 		panic("DynlinkingGo called before all symbols loaded")
 	}
-	return ctxt.BuildMode == BuildModeShared || ctxt.linkShared || ctxt.BuildMode == BuildModePlugin || ctxt.CanUsePlugins()
+	return ctxt.BuildMode == BuildModeShared || ctxt.linkShared || ctxt.BuildMode == BuildModePlugin || ctxt.canUsePlugins
 }
 
 // CanUsePlugins reports whether a plugins can be used
 func (ctxt *Link) CanUsePlugins() bool {
-	return ctxt.Syms.ROLookup("plugin.Open", sym.SymVerABIInternal) != nil
+	if !ctxt.Loaded {
+		panic("CanUsePlugins called before all symbols loaded")
+	}
+	return ctxt.canUsePlugins
 }
 
 // UseRelro reports whether to make use of "read only relocations" aka
@@ -594,6 +598,9 @@ func (ctxt *Link) loadlib() {
 
 	// We've loaded all the code now.
 	ctxt.Loaded = true
+
+	// Record whether we can use plugins.
+	ctxt.canUsePlugins = (ctxt.Syms.ROLookup("plugin.Open", sym.SymVerABIInternal) != nil)
 
 	// If there are no dynamic libraries needed, gcc disables dynamic linking.
 	// Because of this, glibc's dynamic ELF loader occasionally (like in version 2.13)
@@ -1172,6 +1179,14 @@ func (ctxt *Link) hostlink() {
 		} else {
 			argv = append(argv, "-mconsole")
 		}
+		// Mark as having awareness of terminal services, to avoid
+		// ancient compatibility hacks.
+		argv = append(argv, "-Wl,--tsaware")
+
+		argv = append(argv, fmt.Sprintf("-Wl,--major-os-version=%d", PeMinimumTargetMajorVersion))
+		argv = append(argv, fmt.Sprintf("-Wl,--minor-os-version=%d", PeMinimumTargetMinorVersion))
+		argv = append(argv, fmt.Sprintf("-Wl,--major-subsystem-version=%d", PeMinimumTargetMajorVersion))
+		argv = append(argv, fmt.Sprintf("-Wl,--minor-subsystem-version=%d", PeMinimumTargetMinorVersion))
 	case objabi.Haix:
 		argv = append(argv, "-pthread")
 		// prevent ld to reorder .text functions to keep the same
@@ -1248,7 +1263,7 @@ func (ctxt *Link) hostlink() {
 		// from the beginning of the section (like sym.STYPE).
 		argv = append(argv, "-Wl,-znocopyreloc")
 
-		if ctxt.Arch.InFamily(sys.ARM, sys.ARM64) {
+		if ctxt.Arch.InFamily(sys.ARM, sys.ARM64) && (objabi.GOOS == "linux" || objabi.GOOS == "android") {
 			// On ARM, the GNU linker will generate COPY relocations
 			// even with -znocopyreloc set.
 			// https://sourceware.org/bugzilla/show_bug.cgi?id=19962
@@ -1609,6 +1624,9 @@ func ldobj(ctxt *Link, f *bio.Reader, lib *sym.Library, length int64, pn string,
 	c4 := bgetc(f)
 	f.MustSeek(start, 0)
 
+	unit := &sym.CompilationUnit{Lib: lib}
+	lib.Units = append(lib.Units, unit)
+
 	magic := uint32(c1)<<24 | uint32(c2)<<16 | uint32(c3)<<8 | uint32(c4)
 	if magic == 0x7f454c46 { // \x7F E L F
 		ldelf := func(ctxt *Link, f *bio.Reader, pkg string, length int64, pn string) {
@@ -1755,7 +1773,7 @@ func ldobj(ctxt *Link, f *bio.Reader, lib *sym.Library, length int64, pn string,
 	default:
 		log.Fatalf("invalid -strictdups flag value %d", *FlagStrictDups)
 	}
-	c := objfile.Load(ctxt.Arch, ctxt.Syms, f, lib, eof-f.Offset(), pn, flags)
+	c := objfile.Load(ctxt.Arch, ctxt.Syms, f, lib, unit, eof-f.Offset(), pn, flags)
 	strictDupMsgCount += c
 	addImports(ctxt, lib, pn)
 	return nil
@@ -1902,7 +1920,15 @@ func ldshlibsyms(ctxt *Link, shlib string) {
 		if elf.ST_TYPE(elfsym.Info) == elf.STT_NOTYPE || elf.ST_TYPE(elfsym.Info) == elf.STT_SECTION {
 			continue
 		}
-		lsym := ctxt.Syms.Lookup(elfsym.Name, 0)
+
+		// Symbols whose names start with "type." are compiler
+		// generated, so make functions with that prefix internal.
+		ver := 0
+		if elf.ST_TYPE(elfsym.Info) == elf.STT_FUNC && strings.HasPrefix(elfsym.Name, "type.") {
+			ver = sym.SymVerABIInternal
+		}
+
+		lsym := ctxt.Syms.Lookup(elfsym.Name, ver)
 		// Because loadlib above loads all .a files before loading any shared
 		// libraries, any non-dynimport symbols we find that duplicate symbols
 		// already loaded should be ignored (the symbols from the .a files
@@ -1930,7 +1956,7 @@ func ldshlibsyms(ctxt *Link, shlib string) {
 		// the ABIs are actually different. We might have to
 		// mangle Go function names in the .so to include the
 		// ABI.
-		if elf.ST_TYPE(elfsym.Info) == elf.STT_FUNC {
+		if elf.ST_TYPE(elfsym.Info) == elf.STT_FUNC && ver == 0 {
 			alias := ctxt.Syms.Lookup(elfsym.Name, sym.SymVerABIInternal)
 			if alias.Type != 0 {
 				continue
@@ -2058,7 +2084,7 @@ func stkcheck(ctxt *Link, up *chain, depth int) int {
 		s.Attr |= sym.AttrStackCheck
 	}
 
-	if depth > 100 {
+	if depth > 500 {
 		Errorf(s, "nosplit stack check too deep")
 		stkbroke(ctxt, up, 0)
 		return -1
@@ -2115,24 +2141,24 @@ func stkcheck(ctxt *Link, up *chain, depth int) int {
 
 	endr := len(s.R)
 	var ch1 chain
-	pcsp := newPCIter(ctxt)
+	pcsp := obj.NewPCIter(uint32(ctxt.Arch.MinLC))
 	var r *sym.Reloc
-	for pcsp.init(s.FuncInfo.Pcsp.P); !pcsp.done; pcsp.next() {
+	for pcsp.Init(s.FuncInfo.Pcsp.P); !pcsp.Done; pcsp.Next() {
 		// pcsp.value is in effect for [pcsp.pc, pcsp.nextpc).
 
 		// Check stack size in effect for this span.
-		if int32(limit)-pcsp.value < 0 {
-			stkbroke(ctxt, up, int(int32(limit)-pcsp.value))
+		if int32(limit)-pcsp.Value < 0 {
+			stkbroke(ctxt, up, int(int32(limit)-pcsp.Value))
 			return -1
 		}
 
 		// Process calls in this span.
-		for ; ri < endr && uint32(s.R[ri].Off) < pcsp.nextpc; ri++ {
+		for ; ri < endr && uint32(s.R[ri].Off) < pcsp.NextPC; ri++ {
 			r = &s.R[ri]
 			switch r.Type {
 			// Direct call.
 			case objabi.R_CALL, objabi.R_CALLARM, objabi.R_CALLARM64, objabi.R_CALLPOWER, objabi.R_CALLMIPS:
-				ch.limit = int(int32(limit) - pcsp.value - int32(callsize(ctxt)))
+				ch.limit = int(int32(limit) - pcsp.Value - int32(callsize(ctxt)))
 				ch.sym = r.Sym
 				if stkcheck(ctxt, &ch, depth+1) < 0 {
 					return -1
@@ -2143,7 +2169,7 @@ func stkcheck(ctxt *Link, up *chain, depth int) int {
 			// Arrange the data structures to report both calls, so that
 			// if there is an error, stkprint shows all the steps involved.
 			case objabi.R_CALLIND:
-				ch.limit = int(int32(limit) - pcsp.value - int32(callsize(ctxt)))
+				ch.limit = int(int32(limit) - pcsp.Value - int32(callsize(ctxt)))
 
 				ch.sym = nil
 				ch1.limit = ch.limit - callsize(ctxt) // for morestack in called prologue
@@ -2340,7 +2366,6 @@ func genasmsym(ctxt *Link, put func(*Link, *sym.Symbol, string, SymbolType, int6
 		}
 	}
 
-	var off int32
 	for _, s := range ctxt.Textp {
 		put(ctxt, s, s.Name, TextSym, s.Value, s.Gotype)
 
@@ -2353,39 +2378,6 @@ func genasmsym(ctxt *Link, put func(*Link, *sym.Symbol, string, SymbolType, int6
 
 		if s.FuncInfo == nil {
 			continue
-		}
-		for _, a := range s.FuncInfo.Autom {
-			if a.Name == objabi.A_DELETED_AUTO {
-				put(ctxt, nil, "", DeletedAutoSym, 0, a.Gotype)
-				continue
-			}
-
-			// Emit a or p according to actual offset, even if label is wrong.
-			// This avoids negative offsets, which cannot be encoded.
-			if a.Name != objabi.A_AUTO && a.Name != objabi.A_PARAM {
-				continue
-			}
-
-			// compute offset relative to FP
-			if a.Name == objabi.A_PARAM {
-				off = a.Aoffset
-			} else {
-				off = a.Aoffset - int32(ctxt.Arch.PtrSize)
-			}
-
-			// FP
-			if off >= 0 {
-				put(ctxt, nil, a.Asym.Name, ParamSym, int64(off), a.Gotype)
-				continue
-			}
-
-			// SP
-			if off <= int32(-ctxt.Arch.PtrSize) {
-				put(ctxt, nil, a.Asym.Name, AutoSym, -(int64(off) + int64(ctxt.Arch.PtrSize)), a.Gotype)
-				continue
-			}
-			// Otherwise, off is addressing the saved program counter.
-			// Something underhanded is going on. Say nothing.
 		}
 	}
 

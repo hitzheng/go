@@ -42,6 +42,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -3610,10 +3611,11 @@ func (p *http2pipe) Done() <-chan struct{} {
 }
 
 const (
-	http2prefaceTimeout        = 10 * time.Second
-	http2firstSettingsTimeout  = 2 * time.Second // should be in-flight with preface anyway
-	http2handlerChunkWriteSize = 4 << 10
-	http2defaultMaxStreams     = 250 // TODO: make this 100 as the GFE seems to?
+	http2prefaceTimeout         = 10 * time.Second
+	http2firstSettingsTimeout   = 2 * time.Second // should be in-flight with preface anyway
+	http2handlerChunkWriteSize  = 4 << 10
+	http2defaultMaxStreams      = 250 // TODO: make this 100 as the GFE seems to?
+	http2maxQueuedControlFrames = 10000
 )
 
 var (
@@ -3719,6 +3721,15 @@ func (s *http2Server) maxConcurrentStreams() uint32 {
 		return v
 	}
 	return http2defaultMaxStreams
+}
+
+// maxQueuedControlFrames is the maximum number of control frames like
+// SETTINGS, PING and RST_STREAM that will be queued for writing before
+// the connection is closed to prevent memory exhaustion attacks.
+func (s *http2Server) maxQueuedControlFrames() int {
+	// TODO: if anybody asks, add a Server field, and remember to define the
+	// behavior of negative values.
+	return http2maxQueuedControlFrames
 }
 
 type http2serverInternalState struct {
@@ -3831,7 +3842,20 @@ func http2ConfigureServer(s *Server, conf *http2Server) error {
 		if http2testHookOnConn != nil {
 			http2testHookOnConn()
 		}
+		// The TLSNextProto interface predates contexts, so
+		// the net/http package passes down its per-connection
+		// base context via an exported but unadvertised
+		// method on the Handler. This is for internal
+		// net/http<=>http2 use only.
+		var ctx context.Context
+		type baseContexter interface {
+			BaseContext() context.Context
+		}
+		if bc, ok := h.(baseContexter); ok {
+			ctx = bc.BaseContext()
+		}
 		conf.ServeConn(c, &http2ServeConnOpts{
+			Context:    ctx,
 			Handler:    h,
 			BaseConfig: hs,
 		})
@@ -3842,6 +3866,10 @@ func http2ConfigureServer(s *Server, conf *http2Server) error {
 
 // ServeConnOpts are options for the Server.ServeConn method.
 type http2ServeConnOpts struct {
+	// Context is the base context to use.
+	// If nil, context.Background is used.
+	Context context.Context
+
 	// BaseConfig optionally sets the base configuration
 	// for values. If nil, defaults are used.
 	BaseConfig *Server
@@ -3850,6 +3878,13 @@ type http2ServeConnOpts struct {
 	// requests. If nil, BaseConfig.Handler is used. If BaseConfig
 	// or BaseConfig.Handler is nil, http.DefaultServeMux is used.
 	Handler Handler
+}
+
+func (o *http2ServeConnOpts) context() context.Context {
+	if o != nil && o.Context != nil {
+		return o.Context
+	}
+	return context.Background()
 }
 
 func (o *http2ServeConnOpts) baseConfig() *Server {
@@ -3997,7 +4032,7 @@ func (s *http2Server) ServeConn(c net.Conn, opts *http2ServeConnOpts) {
 }
 
 func http2serverConnBaseContext(c net.Conn, opts *http2ServeConnOpts) (ctx context.Context, cancel func()) {
-	ctx, cancel = context.WithCancel(context.Background())
+	ctx, cancel = context.WithCancel(opts.context())
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.LocalAddr())
 	if hs := opts.baseConfig(); hs != nil {
 		ctx = context.WithValue(ctx, ServerContextKey, hs)
@@ -4040,6 +4075,7 @@ type http2serverConn struct {
 	sawFirstSettings            bool // got the initial SETTINGS frame after the preface
 	needToSendSettingsAck       bool
 	unackedSettings             int    // how many SETTINGS have we sent without ACKs?
+	queuedControlFrames         int    // control frames in the writeSched queue
 	clientMaxStreams            uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
 	advMaxStreams               uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	curClientStreams            uint32 // number of open streams initiated by the client
@@ -4431,6 +4467,14 @@ func (sc *http2serverConn) serve() {
 			}
 		}
 
+		// If the peer is causing us to generate a lot of control frames,
+		// but not reading them from us, assume they are trying to make us
+		// run out of memory.
+		if sc.queuedControlFrames > sc.srv.maxQueuedControlFrames() {
+			sc.vlogf("http2: too many control frames in send queue, closing connection")
+			return
+		}
+
 		// Start the shutdown timer after sending a GOAWAY. When sending GOAWAY
 		// with no error code (graceful shutdown), don't start the timer until
 		// all open streams have been completed.
@@ -4632,6 +4676,14 @@ func (sc *http2serverConn) writeFrame(wr http2FrameWriteRequest) {
 	}
 
 	if !ignoreWrite {
+		if wr.isControl() {
+			sc.queuedControlFrames++
+			// For extra safety, detect wraparounds, which should not happen,
+			// and pull the plug.
+			if sc.queuedControlFrames < 0 {
+				sc.conn.Close()
+			}
+		}
 		sc.writeSched.Push(wr)
 	}
 	sc.scheduleFrameWrite()
@@ -4749,10 +4801,8 @@ func (sc *http2serverConn) wroteFrame(res http2frameWriteResult) {
 // If a frame is already being written, nothing happens. This will be called again
 // when the frame is done being written.
 //
-// If a frame isn't being written we need to send one, the best frame
-// to send is selected, preferring first things that aren't
-// stream-specific (e.g. ACKing settings), and then finding the
-// highest priority stream.
+// If a frame isn't being written and we need to send one, the best frame
+// to send is selected by writeSched.
 //
 // If a frame isn't being written and there's nothing else to send, we
 // flush the write buffer.
@@ -4780,6 +4830,9 @@ func (sc *http2serverConn) scheduleFrameWrite() {
 		}
 		if !sc.inGoAway || sc.goAwayCode == http2ErrCodeNo {
 			if wr, ok := sc.writeSched.Pop(); ok {
+				if wr.isControl() {
+					sc.queuedControlFrames--
+				}
 				sc.startFrameWrite(wr)
 				continue
 			}
@@ -5072,6 +5125,8 @@ func (sc *http2serverConn) processSettings(f *http2SettingsFrame) error {
 	if err := f.ForeachSetting(sc.processSetting); err != nil {
 		return err
 	}
+	// TODO: judging by RFC 7540, Section 6.5.3 each SETTINGS frame should be
+	// acknowledged individually, even if multiple are received before the ACK.
 	sc.needToSendSettingsAck = true
 	sc.scheduleFrameWrite()
 	return nil
@@ -5924,7 +5979,11 @@ func (rws *http2responseWriterState) writeChunk(p []byte) (n int, err error) {
 			clen = strconv.Itoa(len(p))
 		}
 		_, hasContentType := rws.snapHeader["Content-Type"]
-		if !hasContentType && http2bodyAllowedForStatus(rws.status) && len(p) > 0 {
+		// If the Content-Encoding is non-blank, we shouldn't
+		// sniff the body. See Issue golang.org/issue/31753.
+		ce := rws.snapHeader.Get("Content-Encoding")
+		hasCE := len(ce) > 0
+		if !hasCE && !hasContentType && http2bodyAllowedForStatus(rws.status) && len(p) > 0 {
 			ctype = DetectContentType(p)
 		}
 		var date string
@@ -6033,7 +6092,7 @@ const http2TrailerPrefix = "Trailer:"
 // trailers. That worked for a while, until we found the first major
 // user of Trailers in the wild: gRPC (using them only over http2),
 // and gRPC libraries permit setting trailers mid-stream without
-// predeclarnig them. So: change of plans. We still permit the old
+// predeclaring them. So: change of plans. We still permit the old
 // way, but we also permit this hack: if a Header() key begins with
 // "Trailer:", the suffix of that key is a Trailer. Because ':' is an
 // invalid token byte anyway, there is no ambiguity. (And it's already
@@ -6333,7 +6392,7 @@ func (sc *http2serverConn) startPush(msg *http2startPushRequest) {
 	// PUSH_PROMISE frames MUST only be sent on a peer-initiated stream that
 	// is in either the "open" or "half-closed (remote)" state.
 	if msg.parent.state != http2stateOpen && msg.parent.state != http2stateHalfClosedRemote {
-		// responseWriter.Push checks that the stream is peer-initiaed.
+		// responseWriter.Push checks that the stream is peer-initiated.
 		msg.done <- http2errStreamClosed
 		return
 	}
@@ -6633,6 +6692,7 @@ type http2ClientConn struct {
 	t         *http2Transport
 	tconn     net.Conn             // usually *tls.Conn, except specialized impls
 	tlsState  *tls.ConnectionState // nil only for specialized impls
+	reused    uint32               // whether conn is being reused; atomic
 	singleUse bool                 // whether being used for a single http.Request
 
 	// readLoop goroutine fields:
@@ -6875,7 +6935,8 @@ func (t *http2Transport) RoundTripOpt(req *Request, opt http2RoundTripOpt) (*Res
 			t.vlogf("http2: Transport failed to get client conn for %s: %v", addr, err)
 			return nil, err
 		}
-		http2traceGotConn(req, cc)
+		reused := !atomic.CompareAndSwapUint32(&cc.reused, 0, 1)
+		http2traceGotConn(req, cc, reused)
 		res, gotErrAfterReqBodyWrite, err := cc.roundTrip(req)
 		if err != nil && retry <= 6 {
 			if req, err = http2shouldRetryRequest(req, err, gotErrAfterReqBodyWrite); err == nil {
@@ -7424,7 +7485,7 @@ func (cc *http2ClientConn) roundTrip(req *Request) (res *Response, gotErrAfterRe
 		req.Method != "HEAD" {
 		// Request gzip only, not deflate. Deflate is ambiguous and
 		// not as universally supported anyway.
-		// See: http://www.gzip.org/zlib/zlib_faq.html#faq38
+		// See: https://zlib.net/zlib_faq.html#faq39
 		//
 		// Note that we don't request this for HEAD requests,
 		// due to a bug in nginx:
@@ -7648,6 +7709,8 @@ var (
 
 	// abort request body write, but send stream reset of cancel.
 	http2errStopReqBodyWriteAndCancel = errors.New("http2: canceling request")
+
+	http2errReqBodyTooLong = errors.New("http2: request body larger than specified content length")
 )
 
 func (cs *http2clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (err error) {
@@ -7670,10 +7733,32 @@ func (cs *http2clientStream) writeRequestBody(body io.Reader, bodyCloser io.Clos
 
 	req := cs.req
 	hasTrailers := req.Trailer != nil
+	remainLen := http2actualContentLength(req)
+	hasContentLen := remainLen != -1
 
 	var sawEOF bool
 	for !sawEOF {
-		n, err := body.Read(buf)
+		n, err := body.Read(buf[:len(buf)-1])
+		if hasContentLen {
+			remainLen -= int64(n)
+			if remainLen == 0 && err == nil {
+				// The request body's Content-Length was predeclared and
+				// we just finished reading it all, but the underlying io.Reader
+				// returned the final chunk with a nil error (which is one of
+				// the two valid things a Reader can do at EOF). Because we'd prefer
+				// to send the END_STREAM bit early, double-check that we're actually
+				// at EOF. Subsequent reads should return (0, EOF) at this point.
+				// If either value is different, we return an error in one of two ways below.
+				var n1 int
+				n1, err = body.Read(buf[n:])
+				remainLen -= int64(n1)
+			}
+			if remainLen < 0 {
+				err = http2errReqBodyTooLong
+				cc.writeStreamReset(cs.ID, http2ErrCodeCancel, err)
+				return err
+			}
+		}
 		if err == io.EOF {
 			sawEOF = true
 			err = nil
@@ -8994,15 +9079,15 @@ func http2traceGetConn(req *Request, hostPort string) {
 	trace.GetConn(hostPort)
 }
 
-func http2traceGotConn(req *Request, cc *http2ClientConn) {
+func http2traceGotConn(req *Request, cc *http2ClientConn, reused bool) {
 	trace := httptrace.ContextClientTrace(req.Context())
 	if trace == nil || trace.GotConn == nil {
 		return
 	}
 	ci := httptrace.GotConnInfo{Conn: cc.tconn}
+	ci.Reused = reused
 	cc.mu.Lock()
-	ci.Reused = cc.nextStreamID > 1
-	ci.WasIdle = len(cc.streams) == 0 && ci.Reused
+	ci.WasIdle = len(cc.streams) == 0 && reused
 	if ci.WasIdle && !cc.lastActive.IsZero() {
 		ci.IdleTime = time.Now().Sub(cc.lastActive)
 	}
@@ -9418,7 +9503,7 @@ type http2WriteScheduler interface {
 
 	// Pop dequeues the next frame to write. Returns false if no frames can
 	// be written. Frames with a given wr.StreamID() are Pop'd in the same
-	// order they are Push'd.
+	// order they are Push'd. No frames should be discarded except by CloseStream.
 	Pop() (wr http2FrameWriteRequest, ok bool)
 }
 
@@ -9460,6 +9545,12 @@ func (wr http2FrameWriteRequest) StreamID() uint32 {
 		return 0
 	}
 	return wr.stream.id
+}
+
+// isControl reports whether wr is a control frame for MaxQueuedControlFrames
+// purposes. That includes non-stream frames and RST_STREAM frames.
+func (wr http2FrameWriteRequest) isControl() bool {
+	return wr.stream == nil
 }
 
 // DataSize returns the number of flow control bytes that must be consumed
@@ -9768,7 +9859,7 @@ func (n *http2priorityNode) addBytes(b int64) {
 }
 
 // walkReadyInOrder iterates over the tree in priority order, calling f for each node
-// with a non-empty write queue. When f returns true, this funcion returns true and the
+// with a non-empty write queue. When f returns true, this function returns true and the
 // walk halts. tmp is used as scratch space for sorting.
 //
 // f(n, openParent) takes two arguments: the node to visit, n, and a bool that is true
@@ -10085,7 +10176,8 @@ type http2randomWriteScheduler struct {
 	zero http2writeQueue
 
 	// sq contains the stream-specific queues, keyed by stream ID.
-	// When a stream is idle or closed, it's deleted from the map.
+	// When a stream is idle, closed, or emptied, it's deleted
+	// from the map.
 	sq map[uint32]*http2writeQueue
 
 	// pool of empty queues for reuse.
@@ -10129,8 +10221,12 @@ func (ws *http2randomWriteScheduler) Pop() (http2FrameWriteRequest, bool) {
 		return ws.zero.shift(), true
 	}
 	// Iterate over all non-idle streams until finding one that can be consumed.
-	for _, q := range ws.sq {
+	for streamID, q := range ws.sq {
 		if wr, ok := q.consume(math.MaxInt32); ok {
+			if q.empty() {
+				delete(ws.sq, streamID)
+				ws.queuePool.put(q)
+			}
 			return wr, true
 		}
 	}

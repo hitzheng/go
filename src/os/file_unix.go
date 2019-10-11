@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin dragonfly freebsd js,wasm linux nacl netbsd openbsd solaris
+// +build aix darwin dragonfly freebsd js,wasm linux netbsd openbsd solaris
 
 package os
 
@@ -225,6 +225,7 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 // Close closes the File, rendering it unusable for I/O.
 // On files that support SetDeadline, any pending I/O operations will
 // be canceled and return immediately with an error.
+// Close will return an error if it has already been called.
 func (f *File) Close() error {
 	if f == nil {
 		return ErrInvalid

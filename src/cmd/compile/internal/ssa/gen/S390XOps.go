@@ -187,6 +187,8 @@ func init() {
 		fpstore    = regInfo{inputs: []regMask{ptrspsb, fp, 0}}
 		fpstoreidx = regInfo{inputs: []regMask{ptrsp, ptrsp, fp, 0}}
 
+		sync = regInfo{inputs: []regMask{0}}
+
 		// LoweredAtomicCas may overwrite arg1, so force it to R0 for now.
 		cas = regInfo{inputs: []regMask{ptrsp, r0, gpsp, 0}, outputs: []regMask{gp, 0}, clobbers: r0}
 
@@ -352,18 +354,9 @@ func init() {
 
 		{name: "FSQRT", argLength: 1, reg: fp11, asm: "FSQRT"}, // sqrt(arg0)
 
-		{name: "MOVDEQ", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "MOVDEQ"}, // extract == condition from arg0
-		{name: "MOVDNE", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "MOVDNE"}, // extract != condition from arg0
-		{name: "MOVDLT", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "MOVDLT"}, // extract signed < condition from arg0
-		{name: "MOVDLE", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "MOVDLE"}, // extract signed <= condition from arg0
-		{name: "MOVDGT", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "MOVDGT"}, // extract signed > condition from arg0
-		{name: "MOVDGE", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "MOVDGE"}, // extract signed >= condition from arg0
-
-		// Different rules for floating point conditions because
-		// any comparison involving a NaN is always false and thus
-		// the patterns for inverting conditions cannot be used.
-		{name: "MOVDGTnoinv", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "MOVDGT"}, // extract floating > condition from arg0
-		{name: "MOVDGEnoinv", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "MOVDGE"}, // extract floating >= condition from arg0
+		// Conditional register-register moves.
+		// The aux for these values is an s390x.CCMask value representing the condition code mask.
+		{name: "LOCGR", argLength: 3, reg: gp2flags1, resultInArg0: true, asm: "LOCGR", aux: "ArchSpecific"}, // load arg1 into arg0 if the condition code in arg2 matches a masked bit in aux.
 
 		{name: "MOVBreg", argLength: 1, reg: gp11sp, asm: "MOVB", typ: "Int64"},    // sign extend arg0 from int8 to int64
 		{name: "MOVBZreg", argLength: 1, reg: gp11sp, asm: "MOVBZ", typ: "UInt64"}, // zero extend arg0 from int8 to int64
@@ -371,9 +364,6 @@ func init() {
 		{name: "MOVHZreg", argLength: 1, reg: gp11sp, asm: "MOVHZ", typ: "UInt64"}, // zero extend arg0 from int16 to int64
 		{name: "MOVWreg", argLength: 1, reg: gp11sp, asm: "MOVW", typ: "Int64"},    // sign extend arg0 from int32 to int64
 		{name: "MOVWZreg", argLength: 1, reg: gp11sp, asm: "MOVWZ", typ: "UInt64"}, // zero extend arg0 from int32 to int64
-		{name: "MOVDreg", argLength: 1, reg: gp11sp, asm: "MOVD"},                  // move from arg0
-
-		{name: "MOVDnop", argLength: 1, reg: gp11, resultInArg0: true}, // nop, return arg0 in same register
 
 		{name: "MOVDconst", reg: gp01, asm: "MOVD", typ: "UInt64", aux: "Int64", rematerializeable: true}, // auxint
 
@@ -487,11 +477,14 @@ func init() {
 		{name: "LoweredPanicBoundsB", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{r1, r2}}, typ: "Mem"}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in generic.go).
 		{name: "LoweredPanicBoundsC", argLength: 3, aux: "Int64", reg: regInfo{inputs: []regMask{r0, r1}}, typ: "Mem"}, // arg0=idx, arg1=len, arg2=mem, returns memory. AuxInt contains report code (see PanicBounds in generic.go).
 
-		// Constant conditon code values. The condition code can be 0, 1, 2 or 3.
+		// Constant condition code values. The condition code can be 0, 1, 2 or 3.
 		{name: "FlagEQ"}, // CC=0 (equal)
 		{name: "FlagLT"}, // CC=1 (less than)
 		{name: "FlagGT"}, // CC=2 (greater than)
 		{name: "FlagOV"}, // CC=3 (overflow)
+
+		// Fast-BCR-serialization to ensure store-load ordering.
+		{name: "SYNC", argLength: 1, reg: sync, asm: "SYNC", typ: "Mem"},
 
 		// Atomic loads. These are just normal loads but return <value,memory> tuples
 		// so they can be properly ordered with other loads.
@@ -564,6 +557,19 @@ func init() {
 			asm:          "POPCNT",
 			typ:          "UInt64",
 			clobberFlags: true,
+		},
+
+		// unsigned multiplication (64x64 → 128)
+		//
+		// Multiply the two 64-bit input operands together and place the 128-bit result into
+		// an even-odd register pair. The second register in the target pair also contains
+		// one of the input operands. Since we don't currently have a way to specify an
+		// even-odd register pair we hardcode this register pair as R2:R3.
+		{
+			name:      "MLGR",
+			argLength: 2,
+			reg:       regInfo{inputs: []regMask{gp, r3}, outputs: []regMask{r2, r3}},
+			asm:       "MLGR",
 		},
 
 		// pseudo operations to sum the output of the POPCNT instruction
@@ -701,15 +707,41 @@ func init() {
 		},
 	}
 
+	// All blocks on s390x have their condition code mask (s390x.CCMask) as the Aux value.
+	// The condition code mask is a 4-bit mask where each bit corresponds to a condition
+	// code value. If the value of the condition code matches a bit set in the condition
+	// code mask then the first successor is executed. Otherwise the second successor is
+	// executed.
+	//
+	// | condition code value |  mask bit  |
+	// +----------------------+------------+
+	// | 0 (equal)            | 0b1000 (8) |
+	// | 1 (less than)        | 0b0100 (4) |
+	// | 2 (greater than)     | 0b0010 (2) |
+	// | 3 (unordered)        | 0b0001 (1) |
+	//
+	// Note: that compare-and-branch instructions must not have bit 3 (0b0001) set.
 	var S390Xblocks = []blockData{
-		{name: "EQ"},
-		{name: "NE"},
-		{name: "LT"},
-		{name: "LE"},
-		{name: "GT"},
-		{name: "GE"},
-		{name: "GTF"}, // FP comparison
-		{name: "GEF"}, // FP comparison
+		// branch on condition
+		{name: "BRC", controls: 1}, // condition code value (flags) is Controls[0]
+
+		// compare-and-branch (register-register)
+		//  - integrates comparison of Controls[0] with Controls[1]
+		//  - both control values must be in general purpose registers
+		{name: "CRJ", controls: 2},   // signed 32-bit integer comparison
+		{name: "CGRJ", controls: 2},  // signed 64-bit integer comparison
+		{name: "CLRJ", controls: 2},  // unsigned 32-bit integer comparison
+		{name: "CLGRJ", controls: 2}, // unsigned 64-bit integer comparison
+
+		// compare-and-branch (register-immediate)
+		//  - integrates comparison of Controls[0] with AuxInt
+		//  - control value must be in a general purpose register
+		//  - the AuxInt value is sign-extended for signed comparisons
+		//    and zero-extended for unsigned comparisons
+		{name: "CIJ", controls: 1, auxint: "Int8"},    // signed 32-bit integer comparison
+		{name: "CGIJ", controls: 1, auxint: "Int8"},   // signed 64-bit integer comparison
+		{name: "CLIJ", controls: 1, auxint: "UInt8"},  // unsigned 32-bit integer comparison
+		{name: "CLGIJ", controls: 1, auxint: "UInt8"}, // unsigned 64-bit integer comparison
 	}
 
 	archs = append(archs, arch{
@@ -723,5 +755,8 @@ func init() {
 		fpregmask:       fp,
 		framepointerreg: -1, // not used
 		linkreg:         int8(num["R14"]),
+		imports: []string{
+			"cmd/internal/obj/s390x",
+		},
 	})
 }
